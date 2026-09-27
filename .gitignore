@@ -1,18 +1,24 @@
-@"
 # Rust
 /luma-server/target/
 /luma-desktop/src-tauri/target/
 
-# Node
+# Node / Vite
 node_modules/
-/luma-desktop/dist/
+dist/
+dist-ssr/
+*.local
+
+# Logs
+*.log
+npm-debug.log*
 
 # IDE / OS
 .vscode/
 .idea/
 Thumbs.db
 .DS_Store
+*.suo
+*.sw?
 
 # env
 .env
-"@ | Out-File -Encoding utf8 D:\Projects\Luma\.gitignore

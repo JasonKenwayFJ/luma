@@ -1,0 +1,18 @@
+@"
+# Rust
+/luma-server/target/
+/luma-desktop/src-tauri/target/
+
+# Node
+node_modules/
+/luma-desktop/dist/
+
+# IDE / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# env
+.env
+"@ | Out-File -Encoding utf8 D:\Projects\Luma\.gitignore

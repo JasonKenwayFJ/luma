@@ -24,4 +24,5 @@ Thumbs.db
 .env
 
 # Server data
-history.jsonl
+luma-server/luma.db*
+history.jsonl*

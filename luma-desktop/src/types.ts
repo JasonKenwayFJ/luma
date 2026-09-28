@@ -1,17 +1,34 @@
-// То, что реально летит по WebSocket. own здесь нет намеренно —
-// это состояние конкретного клиента, а не свойство сообщения.
+export interface AttachmentMeta {
+    name: string;
+    kind: "image" | "video";
+    size: number;
+}
+
+// То, что реально летит по WebSocket.
 export interface WireMessage {
     id: string;
     userId: string;
-    roomId: string; // пока всегда "general", задел на комнаты
+    roomId: string;
     authorName: string;
     avatarUrl?: string;
     text: string;
-    sentAt: string; // ISO 8601, чтобы сортировалось и парсилось однозначно
+    attachments?: AttachmentMeta[]; // пока только метаданные, сами файлы не передаются
+    sentAt: string;
 }
 
-// То, что хранится в state и рендерится. own считается локально
-// при получении/отправке, поэтому расширяем WireMessage, а не дублируем поля.
+// То, что хранится в state: own считается локально.
 export interface ChatMessage extends WireMessage {
     own: boolean;
+}
+
+export interface UserProfile {
+    userId: string;
+    name: string;
+    username: string;
+    createdAt: string;
+}
+
+export interface ChatSummary {
+    id: string; // совпадает с roomId в сообщениях
+    title: string;
 }

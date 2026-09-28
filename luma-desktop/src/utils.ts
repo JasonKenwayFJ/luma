@@ -1,9 +1,10 @@
-const USER_ID_KEY = "luma:userId";
-const USER_NAME_KEY = "luma:userName";
+import { UserProfile } from "./types";
 
-// userId генерируется один раз на инсталляцию приложения и живёт в localStorage
-// вкладки/webview. Это НЕ авторизация — просто способ отличить "себя" от других
-// до появления настоящего логина.
+const USER_ID_KEY = "luma:userId";
+const PROFILE_KEY = "luma:profile";
+
+// userId остаётся тем же, что был раньше, поэтому старые сообщения
+// после регистрации по-прежнему считаются твоими.
 export function getOrCreateUserId(): string {
     let id = localStorage.getItem(USER_ID_KEY);
     if (!id) {
@@ -13,17 +14,31 @@ export function getOrCreateUserId(): string {
     return id;
 }
 
-export function getOrCreateUserName(): string {
-    let name = localStorage.getItem(USER_NAME_KEY);
-    if (!name) {
-        name = `Guest_${Math.floor(Math.random() * 9000 + 1000)}`;
-        localStorage.setItem(USER_NAME_KEY, name);
+export function loadProfile(): UserProfile | null {
+    try {
+        const raw = localStorage.getItem(PROFILE_KEY);
+        if (!raw) return null;
+        const p = JSON.parse(raw);
+        if (
+            p &&
+            typeof p.userId === "string" &&
+            typeof p.name === "string" &&
+            typeof p.username === "string"
+        ) {
+            return p as UserProfile;
+        }
+        return null;
+    } catch {
+        return null;
     }
-    return name;
 }
 
-export function setUserName(name: string) {
-    localStorage.setItem(USER_NAME_KEY, name);
+export function saveProfile(profile: UserProfile) {
+    localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
+}
+
+export function clearProfile() {
+    localStorage.removeItem(PROFILE_KEY);
 }
 
 export function initials(name: string): string {
@@ -42,9 +57,12 @@ export function formatTime(iso: string): string {
     });
 }
 
-// Детерминированный цвет аватарки из userId (простой хэш строки в число,
-// число — в hue для hsl). Один и тот же человек всегда получает один и тот
-// же цвет, без сервера и без хранения этого цвета где-либо.
+export function formatSize(bytes: number): string {
+    if (bytes < 1024) return `${bytes} Б`;
+    if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} КБ`;
+    return `${(bytes / 1024 / 1024).toFixed(1)} МБ`;
+}
+
 export function avatarColor(seed: string): string {
     let hash = 0;
     for (let i = 0; i < seed.length; i++) {

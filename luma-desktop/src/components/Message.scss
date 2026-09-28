@@ -1,7 +1,4 @@
-$accent: #6c5ce7;
-$accent-dim: #4834b0;
-$surface: #1c1f28;
-$border: #2a2e3a;
+@use "../styles/variables" as *;
 
 .row {
   display: flex;
@@ -73,6 +70,37 @@ $border: #2a2e3a;
   opacity: 0.6;
   margin-top: 3px;
   text-align: right;
+}
+
+.bubble__attachments {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 4px;
+}
+
+.chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.1);
+  font-size: 12px;
+}
+
+.chip__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chip__size {
+  flex-shrink: 0;
+  font-size: 11px;
+  opacity: 0.6;
 }
 
 @keyframes pop {

@@ -19,7 +19,8 @@
 .register__logo {
   width: 56px;
   height: 56px;
-  margin: 0 auto;
+  align-self: center;
+  margin-bottom: 2rem;
   border-radius: 16px;
   background: linear-gradient(135deg, $accent, $accent-dim);
   display: flex;

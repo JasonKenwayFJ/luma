@@ -26,3 +26,9 @@ Thumbs.db
 # Server data
 luma-server/luma.db*
 history.jsonl*
+
+# Rust (все target-папки, включая кросс-компиляцию под Android/iOS)
+**/target/
+
+# Tauri: сгенерированные мобильные проекты
+/luma-desktop/src-tauri/gen/

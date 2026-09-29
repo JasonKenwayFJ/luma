@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { AttachmentMeta, ChatMessage, WireMessage } from "../types";
+import type { AttachmentMeta, ChatMessage, ServerFrame, WireMessage } from "../types";
 
 function mergeMessages(prev: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
     const known = new Set(prev.map((m) => m.id));
@@ -27,46 +27,45 @@ export function useChat(userId: string) {
             own: wire.userId === userId,
         });
 
-        const applyHistory = (json: string) => {
-            let wires: WireMessage[];
+        // Один и тот же разбор кадра используется и для живых событий,
+        // и для "подобранного" состояния при монтировании (get_history) —
+        // не хочется держать эту логику в двух местах.
+        const applyFrame = (raw: string) => {
+            let frame: ServerFrame;
             try {
-                wires = JSON.parse(json);
+                frame = JSON.parse(raw);
             } catch {
                 return;
             }
-            setMessages((prev) => mergeMessages(prev, wires.map(toChat)));
+            if (frame.type === "message") {
+                const { type: _type, ...wire } = frame;
+                setMessages((prev) => mergeMessages(prev, [toChat(wire as WireMessage)]));
+            } else if (frame.type === "history" || frame.type === "summary") {
+                setMessages((prev) => mergeMessages(prev, frame.messages.map(toChat)));
+            }
         };
 
-        const unlistenMessage = listen<string>("ws-message", (event) => {
-            let wire: WireMessage;
-            try {
-                wire = JSON.parse(event.payload);
-            } catch {
-                return;
-            }
-            setMessages((prev) => mergeMessages(prev, [toChat(wire)]));
-        });
+        const unlistenFrame = listen<string>("ws-frame", (event) => applyFrame(event.payload));
+        const unlistenStatus = listen<boolean>("ws-status", (event) => setConnected(event.payload));
 
-        const unlistenHistory = listen<string>("ws-history", (event) => {
-            applyHistory(event.payload);
-        });
-
-        const unlistenStatus = listen<boolean>("ws-status", (event) => {
-            setConnected(event.payload);
-        });
-
-        // Разовые запросы: события до подписки потеряны, Rust их помнит.
         invoke<boolean>("get_connection_status").then(setConnected);
         invoke<string | null>("get_history").then((json) => {
-            if (json) applyHistory(json);
+            if (json) applyFrame(json);
         });
 
         return () => {
-            unlistenMessage.then((f) => f());
-            unlistenHistory.then((f) => f());
+            unlistenFrame.then((f) => f());
             unlistenStatus.then((f) => f());
         };
     }, [userId]);
+
+    const joinRoom = useCallback((roomId: string) => {
+        invoke("send_message", { text: JSON.stringify({ type: "join", roomId }) });
+    }, []);
+
+    const leaveRoom = useCallback(() => {
+        invoke("send_message", { text: JSON.stringify({ type: "leave" }) });
+    }, []);
 
     const send = useCallback(
         async ({ roomId, authorName, text, attachments }: SendParams) => {
@@ -80,11 +79,11 @@ export function useChat(userId: string) {
                 sentAt: new Date().toISOString(),
             };
 
-            await invoke("send_message", { text: JSON.stringify(wire) });
+            await invoke("send_message", { text: JSON.stringify({ type: "send", ...wire }) });
             setMessages((prev) => mergeMessages(prev, [{ ...wire, own: true }]));
         },
         [userId]
     );
 
-    return { messages, connected, send };
+    return { messages, connected, send, joinRoom, leaveRoom };
 }

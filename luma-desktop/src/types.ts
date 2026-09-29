@@ -32,3 +32,7 @@ export interface ChatSummary {
     id: string; // совпадает с roomId в сообщениях
     title: string;
 }
+export type ServerFrame =
+    | { type: "summary"; messages: WireMessage[] }
+    | { type: "history"; roomId: string; messages: WireMessage[] }
+    | (WireMessage & { type: "message" });

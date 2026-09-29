@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "luma-desktop/src-tauri",
+    "luma-server"
+]
+resolver = "2"

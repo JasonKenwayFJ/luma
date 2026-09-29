@@ -13,9 +13,9 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 struct WsState {
     tx: mpsc::UnboundedSender<String>,
     connected: Arc<AtomicBool>,
-    // Последняя история, полученная от сервера. Нужна, чтобы React мог
-    // забрать её, даже если она пришла раньше, чем он подписался на события.
-    history: Arc<Mutex<Option<String>>>,
+    // Последний кадр типа "summary" — на случай, если он придёт раньше,
+    // чем React успеет подписаться на события.
+    summary: Arc<Mutex<Option<String>>>,
 }
 
 #[tauri::command]
@@ -30,8 +30,15 @@ fn get_connection_status(state: tauri::State<WsState>) -> bool {
 
 #[tauri::command]
 fn get_history(state: tauri::State<WsState>) -> Option<String> {
-    state.history.lock().unwrap().clone()
+    state.summary.lock().unwrap().clone()
 }
+
+fn frame_type(raw: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|v| v.get("type").and_then(|t| t.as_str().map(|s| s.to_string())))
+}
+
 fn notification_body(raw: &str) -> String {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
         return raw.to_string();
@@ -44,6 +51,7 @@ fn notification_body(raw: &str) -> String {
         format!("{author}: {text}")
     }
 }
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
@@ -52,11 +60,11 @@ fn main() {
 
             let (tx, mut rx) = mpsc::unbounded_channel::<String>();
             let connected = Arc::new(AtomicBool::new(false));
-            let history: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            let summary: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
             app.manage(WsState {
                 tx,
                 connected: connected.clone(),
-                history: history.clone(),
+                summary: summary.clone(),
             });
 
             tauri::async_runtime::spawn(async move {
@@ -87,26 +95,32 @@ fn main() {
                                     incoming = read.next() => {
                                         match incoming {
                                             Some(Ok(Message::Text(text))) => {
-                                                if text.starts_with('[') {
-                                                    // Сначала запоминаем, потом сообщаем.
-                                                    *history.lock().unwrap() = Some(text.clone());
-                                                    app_handle.emit("ws-history", text).ok();
-                                                } else {
-                                                    let is_visible = app_handle
-                                                        .get_webview_window("main")
-                                                        .map(|w| w.is_visible().unwrap_or(false))
-                                                        .unwrap_or(false);
+                                                match frame_type(&text).as_deref() {
+                                                    Some("summary") => {
+                                                        *summary.lock().unwrap() = Some(text.clone());
+                                                        app_handle.emit("ws-frame", text).ok();
+                                                    }
+                                                    Some("message") => {
+                                                        let is_visible = app_handle
+                                                            .get_webview_window("main")
+                                                            .map(|w| w.is_visible().unwrap_or(false))
+                                                            .unwrap_or(false);
 
-                                                    app_handle.emit("ws-message", text.clone()).ok();
+                                                        app_handle.emit("ws-frame", text.clone()).ok();
 
-                                                    if !is_visible {
-                                                        app_handle
-                                                            .notification()
-                                                            .builder()
-                                                            .title("Luma")
-                                                            .body(notification_body(&text))
-                                                            .show()
-                                                            .ok();
+                                                        if !is_visible {
+                                                            app_handle
+                                                                .notification()
+                                                                .builder()
+                                                                .title("Luma")
+                                                                .body(notification_body(&text))
+                                                                .show()
+                                                                .ok();
+                                                        }
+                                                    }
+                                                    _ => {
+                                                        // history и всё остальное — форвардим без уведомления
+                                                        app_handle.emit("ws-frame", text).ok();
                                                     }
                                                 }
                                             }
@@ -149,7 +163,6 @@ fn main() {
                 })
                 .build(app)?;
 
-            // --- Скрытие в трей вместо закрытия ---
             let window = app.get_webview_window("main").unwrap();
             let window_clone = window.clone();
             window.on_window_event(move |event| {

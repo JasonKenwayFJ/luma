@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { useChat } from "./hooks/useChat";
 import { CHATS } from "./chats";
 import { UserProfile } from "./types";
@@ -9,13 +9,21 @@ import ChatView from "./components/ChatView";
 import "./App.scss";
 
 function App() {
-    // Функция без вызова = ленивая инициализация: читается localStorage
-    // один раз при первом рендере, а не на каждом.
     const [userId] = useState(getOrCreateUserId);
     const [profile, setProfile] = useState<UserProfile | null>(loadProfile);
     const [activeChatId, setActiveChatId] = useState<string | null>(null);
 
-    const { messages, connected, send } = useChat(userId);
+    const { messages, connected, send, joinRoom, leaveRoom } = useChat(userId);
+
+    // Один эффект покрывает два случая сразу: открытие чата (activeChatId
+    // меняется на конкретный id) и восстановление соединения, пока чат уже
+    // открыт (connected переключается false → true) — сервер забывает,
+    // в какой комнате было соединение, каждый раз при новом подключении.
+    useEffect(() => {
+        if (connected && activeChatId) {
+            joinRoom(activeChatId);
+        }
+    }, [connected, activeChatId, joinRoom]);
 
     const handleRegister = (data: { name: string; username: string }) => {
         const p: UserProfile = {
@@ -23,7 +31,6 @@ function App() {
             ...data,
             createdAt: new Date().toISOString(),
         };
-        // Здесь позже будет запрос регистрации на сервер.
         saveProfile(p);
         setProfile(p);
     };
@@ -31,6 +38,11 @@ function App() {
     const handleLogout = () => {
         clearProfile();
         setProfile(null);
+        setActiveChatId(null);
+    };
+
+    const closeChat = () => {
+        leaveRoom();
         setActiveChatId(null);
     };
 
@@ -45,7 +57,7 @@ function App() {
                 chat={activeChat}
                 messages={messages.filter((m) => m.roomId === activeChat.id)}
                 connected={connected}
-                onBack={() => setActiveChatId(null)}
+                onBack={closeChat}
                 onSend={(text, attachments) =>
                     send({
                         roomId: activeChat.id,

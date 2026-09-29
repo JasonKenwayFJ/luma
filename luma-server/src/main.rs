@@ -1,6 +1,6 @@
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +29,32 @@ struct WireMessage {
     sent_at: String,
 }
 
+// Кадры от клиента. Внутренне тегированный enum: serde читает поле "type",
+// а остальные поля объекта разбирает как содержимое нужного варианта.
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum ClientFrame {
+    Join {
+        #[serde(rename = "roomId")]
+        room_id: String,
+    },
+    Leave,
+    Send(WireMessage),
+}
+
+// Кадры к клиенту, тем же способом, только на сериализацию.
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum ServerFrame {
+    Summary { messages: Vec<WireMessage> },
+    History {
+        #[serde(rename = "roomId")]
+        room_id: String,
+        messages: Vec<WireMessage>,
+    },
+    Message(WireMessage),
+}
+
 fn is_valid(m: &WireMessage) -> bool {
     !m.id.is_empty()
         && !m.user_id.is_empty()
@@ -38,14 +64,12 @@ fn is_valid(m: &WireMessage) -> bool {
         && (!m.text.is_empty() || m.attachments.is_some())
 }
 
-// ---------- База данных (Postgres / Neon) ----------
+// ---------- База данных ----------
 
 async fn init_db() -> PgPool {
     let url = std::env::var("DATABASE_URL")
         .expect("DATABASE_URL is not set (create luma-server/.env)");
 
-    // acquire_timeout с запасом: бесплатный compute в Neon засыпает
-    // при простое, и первое подключение после паузы занимает пару секунд.
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .acquire_timeout(Duration::from_secs(15))
@@ -81,7 +105,6 @@ async fn init_db() -> PgPool {
     pool
 }
 
-// true = сообщение новое, false = такой id уже был.
 async fn save_message(pool: &PgPool, m: &WireMessage) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(
         "INSERT INTO messages
@@ -103,49 +126,68 @@ async fn save_message(pool: &PgPool, m: &WireMessage) -> Result<bool, sqlx::Erro
     Ok(result.rows_affected() > 0)
 }
 
-// Последние N сообщений по всем комнатам, от старых к новым.
-async fn load_recent(pool: &PgPool, limit: i64) -> Vec<WireMessage> {
-    // to_char возвращает время в том же виде, что JS toISOString():
-    // 2026-09-28T18:16:00.123Z. Клиент сортирует эти строки как текст,
-    // поэтому формат должен быть строго фиксированной длины.
-    let rows = sqlx::query(
-        "SELECT recent.id, recent.room_id, recent.user_id, recent.author_name,
-                recent.avatar_url, recent.text, recent.attachments,
-                to_char(recent.sent_at AT TIME ZONE 'UTC',
-                        'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS sent_at
-         FROM (
-             SELECT * FROM messages
-             ORDER BY sent_at DESC, created_at DESC
-             LIMIT $1
-         ) recent
-         ORDER BY recent.sent_at ASC, recent.created_at ASC",
-    )
-        .bind(limit)
-        .fetch_all(pool)
-        .await;
+fn row_to_message(r: &PgRow) -> WireMessage {
+    WireMessage {
+        id: r.get("id"),
+        user_id: r.get("user_id"),
+        room_id: r.get("room_id"),
+        author_name: r.get("author_name"),
+        avatar_url: r.get("avatar_url"),
+        text: r.get("text"),
+        attachments: r.get("attachments"),
+        sent_at: r.get("sent_at"),
+    }
+}
+
+const SENT_AT_EXPR: &str =
+    "to_char(sent_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS sent_at";
+
+// Последние N сообщений ОДНОЙ комнаты. Берём свежие первыми (удобно для
+// LIMIT), а затем переворачиваем в Rust, чтобы клиенту прийти по
+// возрастанию времени — без вложенных подзапросов ради этого в SQL.
+async fn load_room_history(pool: &PgPool, room_id: &str, limit: i64) -> Vec<WireMessage> {
+    let sql = format!(
+        "SELECT id, room_id, user_id, author_name, avatar_url, text, attachments, {SENT_AT_EXPR}
+         FROM messages
+         WHERE room_id = $1
+         ORDER BY sent_at DESC, created_at DESC
+         LIMIT $2"
+    );
+    let rows = sqlx::query(&sql).bind(room_id).bind(limit).fetch_all(pool).await;
 
     match rows {
-        Ok(rows) => rows
-            .into_iter()
-            .map(|r| WireMessage {
-                id: r.get("id"),
-                user_id: r.get("user_id"),
-                room_id: r.get("room_id"),
-                author_name: r.get("author_name"),
-                avatar_url: r.get("avatar_url"),
-                text: r.get("text"),
-                attachments: r.get("attachments"),
-                sent_at: r.get("sent_at"),
-            })
-            .collect(),
+        Ok(rows) => {
+            let mut messages: Vec<WireMessage> = rows.iter().map(row_to_message).collect();
+            messages.reverse();
+            messages
+        }
         Err(e) => {
-            eprintln!("db read error: {e}");
+            eprintln!("db read error (history): {e}");
             Vec::new()
         }
     }
 }
 
-// Разовый перенос старого history.jsonl, если он лежит рядом.
+// По одному последнему сообщению на каждую комнату — для превью в списке
+// чатов, ещё до того как пользователь куда-то зашёл.
+async fn load_summary(pool: &PgPool) -> Vec<WireMessage> {
+    let sql = format!(
+        "SELECT DISTINCT ON (room_id)
+                id, room_id, user_id, author_name, avatar_url, text, attachments, {SENT_AT_EXPR}
+         FROM messages
+         ORDER BY room_id, sent_at DESC, created_at DESC"
+    );
+    let rows = sqlx::query(&sql).fetch_all(pool).await;
+
+    match rows {
+        Ok(rows) => rows.iter().map(row_to_message).collect(),
+        Err(e) => {
+            eprintln!("db read error (summary): {e}");
+            Vec::new()
+        }
+    }
+}
+
 async fn import_legacy_history(pool: &PgPool) {
     let Ok(content) = std::fs::read_to_string(LEGACY_HISTORY_FILE) else {
         return;
@@ -160,11 +202,7 @@ async fn import_legacy_history(pool: &PgPool) {
         }
     }
 
-    std::fs::rename(
-        LEGACY_HISTORY_FILE,
-        format!("{LEGACY_HISTORY_FILE}.imported"),
-    )
-        .ok();
+    std::fs::rename(LEGACY_HISTORY_FILE, format!("{LEGACY_HISTORY_FILE}.imported")).ok();
     println!("Imported {imported} messages from {LEGACY_HISTORY_FILE}");
 }
 
@@ -172,8 +210,6 @@ async fn import_legacy_history(pool: &PgPool) {
 
 #[tokio::main]
 async fn main() {
-    // Читает luma-server/.env в переменные окружения процесса.
-    // Если файла нет, не страшно: на хостинге переменная задаётся напрямую.
     dotenvy::dotenv().ok();
 
     let pool = init_db().await;
@@ -183,7 +219,9 @@ async fn main() {
     let listener = TcpListener::bind("127.0.0.1:8080").await.unwrap();
     println!("Luma WS relay running on ws://127.0.0.1:8080");
 
-    let (tx, _rx) = broadcast::channel::<(usize, String)>(100);
+    // (sender_id, room_id, JSON-кадр): каждое соединение само решает,
+    // интересна ли ему эта комната, при получении из broadcast.
+    let (tx, _rx) = broadcast::channel::<(usize, String, String)>(200);
     let next_id = Arc::new(Mutex::new(0usize));
 
     loop {
@@ -207,8 +245,8 @@ async fn main() {
 async fn handle_connection(
     stream: TcpStream,
     my_id: usize,
-    tx: broadcast::Sender<(usize, String)>,
-    mut rx: broadcast::Receiver<(usize, String)>,
+    tx: broadcast::Sender<(usize, String, String)>,
+    mut rx: broadcast::Receiver<(usize, String, String)>,
     pool: PgPool,
 ) {
     let ws_stream = match accept_async(stream).await {
@@ -217,47 +255,72 @@ async fn handle_connection(
     };
     let (mut write, mut read) = ws_stream.split();
 
-    let recent = load_recent(&pool, HISTORY_LIMIT).await;
-    if !recent.is_empty() {
-        let json = serde_json::to_string(&recent).unwrap();
+    // Сводка сразу при подключении, ещё до всякого join.
+    let summary = load_summary(&pool).await;
+    if !summary.is_empty() {
+        let json = serde_json::to_string(&ServerFrame::Summary { messages: summary }).unwrap();
         if write.send(Message::Text(json)).await.is_err() {
             return;
         }
     }
 
-    let write_task = tokio::spawn(async move {
-        while let Ok((sender_id, text)) = rx.recv().await {
-            if sender_id != my_id {
-                if write.send(Message::Text(text)).await.is_err() {
-                    break;
-                }
-            }
-        }
-    });
+    // Комната, которую сейчас смотрит этот клиент. None — он в списке
+    // чатов, живые сообщения ему пока не нужны.
+    let mut current_room: Option<String> = None;
 
-    while let Some(msg) = read.next().await {
-        match msg {
-            Ok(Message::Text(text)) => {
-                let Ok(m) = serde_json::from_str::<WireMessage>(&text) else {
-                    continue;
-                };
-                if !is_valid(&m) {
-                    continue;
-                }
-
-                match save_message(&pool, &m).await {
-                    Ok(true) => {
-                        let json = serde_json::to_string(&m).unwrap();
-                        let _ = tx.send((my_id, json));
+    loop {
+        tokio::select! {
+            incoming = read.next() => {
+                match incoming {
+                    Some(Ok(Message::Text(text))) => {
+                        match serde_json::from_str::<ClientFrame>(&text) {
+                            Ok(ClientFrame::Join { room_id }) => {
+                                let messages = load_room_history(&pool, &room_id, HISTORY_LIMIT).await;
+                                let frame = ServerFrame::History { room_id: room_id.clone(), messages };
+                                current_room = Some(room_id);
+                                let json = serde_json::to_string(&frame).unwrap();
+                                if write.send(Message::Text(json)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(ClientFrame::Leave) => {
+                                current_room = None;
+                            }
+                            Ok(ClientFrame::Send(m)) => {
+                                if is_valid(&m) {
+                                    match save_message(&pool, &m).await {
+                                        Ok(true) => {
+                                            let room_id = m.room_id.clone();
+                                            let json =
+                                                serde_json::to_string(&ServerFrame::Message(m)).unwrap();
+                                            let _ = tx.send((my_id, room_id, json));
+                                        }
+                                        Ok(false) => {}
+                                        Err(e) => eprintln!("db write error: {e}"),
+                                    }
+                                }
+                            }
+                            Err(e) => eprintln!("bad client frame: {e}"),
+                        }
                     }
-                    Ok(false) => {}
-                    Err(e) => eprintln!("db write error: {e}"),
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                    _ => {}
                 }
             }
-            Ok(Message::Close(_)) | Err(_) => break,
-            _ => {}
+
+            outgoing = rx.recv() => {
+                match outgoing {
+                    Ok((sender_id, room_id, json)) => {
+                        // Своё эхо не шлём, чужое — только если сейчас в этой же комнате.
+                        if sender_id != my_id && current_room.as_deref() == Some(room_id.as_str()) {
+                            if write.send(Message::Text(json)).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => {} // это соединение отстало от канала — пропускаем, не критично для MVP
+                }
+            }
         }
     }
-
-    write_task.abort();
 }

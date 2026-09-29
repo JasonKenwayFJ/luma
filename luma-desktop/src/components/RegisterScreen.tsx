@@ -1,5 +1,6 @@
-import { useState, type ChangeEvent, type FormEvent } from "react";
+import {useState, type ChangeEvent, type FormEvent} from "react";
 import "./RegisterScreen.scss";
+import icon from "../assets/luma-icon.png";
 
 interface Props {
     onSubmit: (data: { name: string; username: string }) => void;
@@ -7,7 +8,7 @@ interface Props {
 
 const USERNAME_RE = /^[a-z0-9_]{3,20}$/;
 
-function RegisterScreen({ onSubmit }: Props) {
+function RegisterScreen({onSubmit}: Props) {
     const [name, setName] = useState("");
     const [username, setUsername] = useState("");
     const [touched, setTouched] = useState(false);
@@ -28,13 +29,16 @@ function RegisterScreen({ onSubmit }: Props) {
         e.preventDefault();
         setTouched(true);
         if (nameError || usernameError) return;
-        onSubmit({ name: trimmedName, username });
+        onSubmit({name: trimmedName, username});
     };
 
     return (
         <div className="register">
             <form className="register__card" onSubmit={handleSubmit}>
-                <div className="register__logo">L</div>
+                <div className="register__logo">
+                    <img src={icon} alt="Luma"/>
+                </div>
+
                 <h1 className="register__title">Добро пожаловать в Luma</h1>
                 <p className="register__subtitle">Создайте профиль, чтобы начать общение</p>
 

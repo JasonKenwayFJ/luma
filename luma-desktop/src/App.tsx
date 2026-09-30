@@ -34,13 +34,15 @@ function App() {
         (async () => {
             try {
                 await requestPermission();
-                const token = await getToken();
+                const result = await getToken();
+                // Разные версии плагина возвращают то голую строку, то объект
+                // { token: "..." } — обрабатываем оба варианта, а не гадаем один.
+                const token = typeof result === "string" ? result : (result as { token?: string })?.token;
+                console.log("fcm token:", token);
                 if (token) {
                     await invoke("save_fcm_token", { token, authToken: profile.token });
                 }
             } catch (e) {
-                // На десктопе плагин ничего не делает (no-op) — это нормально,
-                // push нужен только на Android/iOS.
                 console.log("push setup skipped:", e);
             }
         })();

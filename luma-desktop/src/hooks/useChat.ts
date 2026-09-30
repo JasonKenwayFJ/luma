@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { AttachmentMeta, ChatMessage, ServerFrame, WireMessage } from "../types";
+import type { AttachmentMeta, ChatMessage, ServerFrame, UserProfile, WireMessage } from "../types";
 
 function mergeMessages(prev: ChatMessage[], incoming: ChatMessage[]): ChatMessage[] {
     const known = new Set(prev.map((m) => m.id));
@@ -12,24 +12,27 @@ function mergeMessages(prev: ChatMessage[], incoming: ChatMessage[]): ChatMessag
 
 interface SendParams {
     roomId: string;
-    authorName: string;
     text: string;
     attachments: AttachmentMeta[];
 }
 
-export function useChat(userId: string) {
+export function useChat(profile: UserProfile | null) {
     const [messages, setMessages] = useState<ChatMessage[]>([]);
     const [connected, setConnected] = useState(false);
+    const [hasMoreByRoom, setHasMoreByRoom] = useState<Record<string, boolean>>({});
+    const [loadingMore, setLoadingMore] = useState(false);
 
+    const profileRef = useRef(profile);
+    profileRef.current = profile;
+
+    // Подписки на события живут всё время работы приложения — вне
+    // зависимости от того, залогинен пользователь сейчас или нет.
     useEffect(() => {
         const toChat = (wire: WireMessage): ChatMessage => ({
             ...wire,
-            own: wire.userId === userId,
+            own: wire.userId === profileRef.current?.userId,
         });
 
-        // Один и тот же разбор кадра используется и для живых событий,
-        // и для "подобранного" состояния при монтировании (get_history) —
-        // не хочется держать эту логику в двух местах.
         const applyFrame = (raw: string) => {
             let frame: ServerFrame;
             try {
@@ -37,11 +40,16 @@ export function useChat(userId: string) {
             } catch {
                 return;
             }
-            if (frame.type === "message") {
+
+            if (frame.type === "message" || frame.type === "preview") {
                 const { type: _type, ...wire } = frame;
                 setMessages((prev) => mergeMessages(prev, [toChat(wire as WireMessage)]));
-            } else if (frame.type === "history" || frame.type === "summary") {
+            } else if (frame.type === "summary") {
                 setMessages((prev) => mergeMessages(prev, frame.messages.map(toChat)));
+            } else if (frame.type === "history") {
+                setMessages((prev) => mergeMessages(prev, frame.messages.map(toChat)));
+                setHasMoreByRoom((prev) => ({ ...prev, [frame.roomId]: frame.hasMore }));
+                if (!frame.isInitial) setLoadingMore(false);
             }
         };
 
@@ -57,7 +65,18 @@ export function useChat(userId: string) {
             unlistenFrame.then((f) => f());
             unlistenStatus.then((f) => f());
         };
-    }, [userId]);
+    }, []);
+
+    // А вот само соединение живёт только пока пользователь залогинен:
+    // логин подключает сокет с токеном, логаут рвёт его.
+    useEffect(() => {
+        if (profile) {
+            invoke("connect_ws", { token: profile.token });
+        } else {
+            invoke("disconnect_ws");
+            setMessages([]);
+        }
+    }, [profile]);
 
     const joinRoom = useCallback((roomId: string) => {
         invoke("send_message", { text: JSON.stringify({ type: "join", roomId }) });
@@ -67,23 +86,32 @@ export function useChat(userId: string) {
         invoke("send_message", { text: JSON.stringify({ type: "leave" }) });
     }, []);
 
-    const send = useCallback(
-        async ({ roomId, authorName, text, attachments }: SendParams) => {
-            const wire: WireMessage = {
-                id: crypto.randomUUID(),
-                userId,
-                roomId,
-                authorName,
-                text,
-                ...(attachments.length > 0 ? { attachments } : {}),
-                sentAt: new Date().toISOString(),
-            };
+    const loadMore = useCallback((roomId: string, oldestSentAt: string) => {
+        setLoadingMore(true);
+        invoke("send_message", {
+            text: JSON.stringify({ type: "loadMore", roomId, beforeSentAt: oldestSentAt }),
+        });
+    }, []);
 
-            await invoke("send_message", { text: JSON.stringify({ type: "send", ...wire }) });
-            setMessages((prev) => mergeMessages(prev, [{ ...wire, own: true }]));
-        },
-        [userId]
-    );
+    const send = useCallback(async ({ roomId, text, attachments }: SendParams) => {
+        const p = profileRef.current;
+        if (!p) return;
 
-    return { messages, connected, send, joinRoom, leaveRoom };
+        // userId, authorName и sentAt всё равно перезапишет сервер — здесь они
+        // нужны только для мгновенного локального отображения своего сообщения.
+        const wire: WireMessage = {
+            id: crypto.randomUUID(),
+            userId: p.userId,
+            roomId,
+            authorName: p.username,
+            text,
+            ...(attachments.length > 0 ? { attachments } : {}),
+            sentAt: new Date().toISOString(),
+        };
+
+        await invoke("send_message", { text: JSON.stringify({ type: "send", ...wire }) });
+        setMessages((prev) => mergeMessages(prev, [{ ...wire, own: true }]));
+    }, []);
+
+    return { messages, connected, hasMoreByRoom, loadingMore, send, joinRoom, leaveRoom, loadMore };
 }

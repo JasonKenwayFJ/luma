@@ -2,9 +2,10 @@ export interface AttachmentMeta {
     name: string;
     kind: "image" | "video";
     size: number;
+    mimeType: string;
+    dataBase64: string;
 }
 
-// То, что реально летит по WebSocket.
 export interface WireMessage {
     id: string;
     userId: string;
@@ -12,27 +13,27 @@ export interface WireMessage {
     authorName: string;
     avatarUrl?: string;
     text: string;
-    attachments?: AttachmentMeta[]; // пока только метаданные, сами файлы не передаются
+    attachments?: AttachmentMeta[];
     sentAt: string;
 }
 
-// То, что хранится в state: own считается локально.
 export interface ChatMessage extends WireMessage {
     own: boolean;
 }
 
 export interface UserProfile {
+    token: string;
     userId: string;
-    name: string;
     username: string;
-    createdAt: string;
 }
 
 export interface ChatSummary {
-    id: string; // совпадает с roomId в сообщениях
+    id: string;
     title: string;
 }
+
 export type ServerFrame =
     | { type: "summary"; messages: WireMessage[] }
-    | { type: "history"; roomId: string; messages: WireMessage[] }
-    | (WireMessage & { type: "message" });
+    | { type: "history"; roomId: string; messages: WireMessage[]; hasMore: boolean; isInitial: boolean }
+    | (WireMessage & { type: "message" })
+    | (WireMessage & { type: "preview" });

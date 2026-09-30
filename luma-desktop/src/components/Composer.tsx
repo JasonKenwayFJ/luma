@@ -7,20 +7,37 @@ interface Props {
     onSend: (text: string, attachments: AttachmentMeta[]) => Promise<void>;
 }
 
-const MAX_FILES = 10;
+const MAX_FILES = 5;
+const MAX_FILE_BYTES = 5 * 1024 * 1024; // 5 МБ на файл
 
 const isVideo = (f: File) => f.type.startsWith("video/");
+
+// FileReader — коллбэк-based API из старого браузерного мира, промис
+// оборачивает его в await-совместимую форму. onload и onerror сработают
+// ровно один раз каждый, поэтому reject/resolve не конфликтуют.
+function readAsBase64(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+            const result = reader.result as string;
+            // readAsDataURL отдаёт "data:image/png;base64,iVBORw0KG...".
+            // На сервер и в базу летит только то, что после запятой.
+            const base64 = result.slice(result.indexOf(",") + 1);
+            resolve(base64);
+        };
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+    });
+}
 
 function Composer({ connected, onSend }: Props) {
     const [text, setText] = useState("");
     const [files, setFiles] = useState<File[]>([]);
     const [previews, setPreviews] = useState<{ file: File; url: string }[]>([]);
+    const [error, setError] = useState<string | null>(null);
+    const [sending, setSending] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
 
-    // Превью строятся из blob-URL. Каждый URL держит файл в памяти,
-    // пока его не освободят, поэтому cleanup-функция эффекта делает
-    // revokeObjectURL: она срабатывает перед пересозданием превью
-    // (при смене files) и при размонтировании компонента.
     useEffect(() => {
         const next = files.map((file) => ({ file, url: URL.createObjectURL(file) }));
         setPreviews(next);
@@ -28,29 +45,51 @@ function Composer({ connected, onSend }: Props) {
     }, [files]);
 
     const handlePick = (e: ChangeEvent<HTMLInputElement>) => {
-        // Сначала копируем FileList в массив: он «живой», и сброс value ниже его очистит.
         const picked = Array.from(e.target.files ?? []);
-        setFiles((prev) => [...prev, ...picked].slice(0, MAX_FILES));
-        // Сброс нужен, чтобы onChange сработал снова, если выбрать тот же файл ещё раз.
         e.target.value = "";
+
+        const tooBig = picked.filter((f) => f.size > MAX_FILE_BYTES);
+        const ok = picked.filter((f) => f.size <= MAX_FILE_BYTES);
+
+        if (tooBig.length > 0) {
+            setError(`Слишком большой файл (макс. 5 МБ): ${tooBig.map((f) => f.name).join(", ")}`);
+        } else {
+            setError(null);
+        }
+
+        setFiles((prev) => [...prev, ...ok].slice(0, MAX_FILES));
     };
 
     const removeFile = (index: number) => {
         setFiles((prev) => prev.filter((_, i) => i !== index));
     };
 
-    const canSend = connected && (text.trim().length > 0 || files.length > 0);
+    const canSend = connected && !sending && (text.trim().length > 0 || files.length > 0);
 
     const send = async () => {
         if (!canSend) return;
-        const attachments: AttachmentMeta[] = files.map((f) => ({
-            name: f.name,
-            kind: isVideo(f) ? "video" : "image",
-            size: f.size,
-        }));
-        await onSend(text.trim(), attachments);
-        setText("");
-        setFiles([]);
+        setSending(true);
+        setError(null);
+        try {
+            // Файлы читаются параллельно: Promise.all ждёт все FileReader'ы
+            // разом, вместо того чтобы кодировать их по очереди.
+            const attachments: AttachmentMeta[] = await Promise.all(
+                files.map(async (f) => ({
+                    name: f.name,
+                    kind: isVideo(f) ? ("video" as const) : ("image" as const),
+                    size: f.size,
+                    mimeType: f.type || "application/octet-stream",
+                    dataBase64: await readAsBase64(f),
+                }))
+            );
+            await onSend(text.trim(), attachments);
+            setText("");
+            setFiles([]);
+        } catch {
+            setError("Не удалось прочитать файл, попробуйте ещё раз");
+        } finally {
+            setSending(false);
+        }
     };
 
     const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
@@ -62,6 +101,8 @@ function Composer({ connected, onSend }: Props) {
 
     return (
         <footer className="composer">
+            {error && <div className="composer__error">{error}</div>}
+
             {previews.length > 0 && (
                 <div className="composer__attachments">
                     {previews.map((p, i) => (
@@ -75,6 +116,7 @@ function Composer({ connected, onSend }: Props) {
                                 className="attach__remove"
                                 onClick={() => removeFile(i)}
                                 title="Убрать"
+                                disabled={sending}
                             >
                                 ×
                             </button>
@@ -97,6 +139,7 @@ function Composer({ connected, onSend }: Props) {
                     className="composer__attach"
                     onClick={() => fileInputRef.current?.click()}
                     title="Прикрепить фото или видео"
+                    disabled={sending}
                 >
                     📎
                 </button>
@@ -105,10 +148,17 @@ function Composer({ connected, onSend }: Props) {
                     value={text}
                     onChange={(e) => setText(e.target.value)}
                     onKeyDown={handleKeyDown}
-                    placeholder={connected ? "Напишите сообщение..." : "Нет связи с сервером..."}
+                    placeholder={
+                        connected
+                            ? sending
+                                ? "Отправка вложений..."
+                                : "Напишите сообщение..."
+                            : "Нет связи с сервером..."
+                    }
+                    disabled={sending}
                 />
                 <button className="composer__send" onClick={send} disabled={!canSend}>
-                    ➤
+                    {sending ? "…" : "➤"}
                 </button>
             </div>
         </footer>

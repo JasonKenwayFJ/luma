@@ -1,5 +1,5 @@
 import { ChatMessage } from "../types";
-import { initials, formatTime, formatSize, avatarColor } from "../utils";
+import { initials, formatTime, avatarColor } from "../utils";
 import "./Message.scss";
 
 interface MessageProps {
@@ -25,13 +25,18 @@ function Message({ message }: MessageProps) {
 
                 {attachments && attachments.length > 0 && (
                     <div className="bubble__attachments">
-                        {attachments.map((a, i) => (
-                            <div className="chip" key={i}>
-                                <span>{a.kind === "video" ? "🎬" : "🖼"}</span>
-                                <span className="chip__name">{a.name}</span>
-                                <span className="chip__size">{formatSize(a.size)}</span>
-                            </div>
-                        ))}
+                        {attachments.map((a, i) => {
+                            const src = `data:${a.mimeType};base64,${a.dataBase64}`;
+                            return (
+                                <div className="media" key={i}>
+                                    {a.kind === "video" ? (
+                                        <video src={src} controls preload="metadata" />
+                                    ) : (
+                                        <img src={src} alt={a.name} />
+                                    )}
+                                </div>
+                            );
+                        })}
                     </div>
                 )}
 

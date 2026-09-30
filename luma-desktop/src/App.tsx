@@ -2,35 +2,50 @@ import { useEffect, useState, type ReactNode } from "react";
 import { useChat } from "./hooks/useChat";
 import { CHATS } from "./chats";
 import { UserProfile } from "./types";
-import { clearProfile, getOrCreateUserId, loadProfile, saveProfile } from "./utils";
-import RegisterScreen from "./components/RegisterScreen";
+import { clearProfile, loadProfile, saveProfile } from "./auth";
+import { addContact, contactsToChats, dmRoomId, loadContacts, type Contact } from "./contacts";
+import AuthScreen from "./components/AuthScreen";
 import ChatList from "./components/ChatList";
 import ChatView from "./components/ChatView";
+import { requestPermission, getToken } from "tauri-plugin-remote-push-api";
 import "./App.scss";
+import {invoke} from "@tauri-apps/api/core";
 
 function App() {
-    const [userId] = useState(getOrCreateUserId);
     const [profile, setProfile] = useState<UserProfile | null>(loadProfile);
+    const [contacts, setContacts] = useState<Contact[]>(loadContacts);
     const [activeChatId, setActiveChatId] = useState<string | null>(null);
 
-    const { messages, connected, send, joinRoom, leaveRoom } = useChat(userId);
+    const { messages, connected, hasMoreByRoom, loadingMore, send, joinRoom, leaveRoom, loadMore } =
+        useChat(profile);
 
-    // Один эффект покрывает два случая сразу: открытие чата (activeChatId
-    // меняется на конкретный id) и восстановление соединения, пока чат уже
-    // открыт (connected переключается false → true) — сервер забывает,
-    // в какой комнате было соединение, каждый раз при новом подключении.
+    const directChats = profile ? contactsToChats(contacts, profile.userId) : [];
+    const allChats = [...CHATS, ...directChats];
+    const activeChat = allChats.find((c) => c.id === activeChatId);
+
     useEffect(() => {
         if (connected && activeChatId) {
             joinRoom(activeChatId);
         }
     }, [connected, activeChatId, joinRoom]);
+    useEffect(() => {
+        if (!profile) return;
 
-    const handleRegister = (data: { name: string; username: string }) => {
-        const p: UserProfile = {
-            userId,
-            ...data,
-            createdAt: new Date().toISOString(),
-        };
+        (async () => {
+            try {
+                await requestPermission();
+                const token = await getToken();
+                if (token) {
+                    await invoke("save_fcm_token", { token, authToken: profile.token });
+                }
+            } catch (e) {
+                // На десктопе плагин ничего не делает (no-op) — это нормально,
+                // push нужен только на Android/iOS.
+                console.log("push setup skipped:", e);
+            }
+        })();
+    }, [profile]);
+    const handleAuthenticated = (p: UserProfile) => {
         saveProfile(p);
         setProfile(p);
     };
@@ -46,36 +61,38 @@ function App() {
         setActiveChatId(null);
     };
 
-    const activeChat = CHATS.find((c) => c.id === activeChatId);
+    const handleStartDirect = (userId: string, username: string) => {
+        if (!profile) return;
+        addContact({ userId, username });
+        setContacts(loadContacts());
+        setActiveChatId(dmRoomId(profile.userId, userId));
+    };
 
     let screen: ReactNode;
     if (!profile) {
-        screen = <RegisterScreen onSubmit={handleRegister} />;
+        screen = <AuthScreen onAuthenticated={handleAuthenticated} />;
     } else if (activeChat) {
         screen = (
             <ChatView
                 chat={activeChat}
                 messages={messages.filter((m) => m.roomId === activeChat.id)}
                 connected={connected}
+                hasMore={hasMoreByRoom[activeChat.id] ?? false}
+                loadingMore={loadingMore}
                 onBack={closeChat}
-                onSend={(text, attachments) =>
-                    send({
-                        roomId: activeChat.id,
-                        authorName: profile.name,
-                        text,
-                        attachments,
-                    })
-                }
+                onSend={(text, attachments) => send({ roomId: activeChat.id, text, attachments })}
+                onLoadMore={(oldestSentAt) => loadMore(activeChat.id, oldestSentAt)}
             />
         );
     } else {
         screen = (
             <ChatList
                 profile={profile}
-                chats={CHATS}
+                chats={allChats}
                 messages={messages}
                 connected={connected}
                 onOpen={setActiveChatId}
+                onStartDirect={handleStartDirect}
                 onLogout={handleLogout}
             />
         );

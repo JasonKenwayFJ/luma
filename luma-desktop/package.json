@@ -10,10 +10,13 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@spicavi/tauri-plugin-push-notifications": "^0.1.0",
     "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-notification": "^2.5.0",
     "@tauri-apps/plugin-opener": "^2",
     "react": "^19.1.0",
-    "react-dom": "^19.1.0"
+    "react-dom": "^19.1.0",
+    "tauri-plugin-remote-push-api": "^1.0.10"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",

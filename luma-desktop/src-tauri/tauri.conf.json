@@ -1,8 +1,13 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "luma-desktop",
+  "productName": "Luma",
   "version": "0.1.0",
-  "identifier": "com.jason.luma",
+  "identifier": "com.coffeemain.luma",
+  "plugins": {
+    "remote-push": {
+      "senderId": "232695151564"
+    }
+  },
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +17,7 @@
   "app": {
     "windows": [
       {
-        "title": "luma-desktop",
+        "title": "Luma",
         "width": 800,
         "height": 600
       }

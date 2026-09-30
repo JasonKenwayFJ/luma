@@ -1,17 +1,26 @@
+use argon2::password_hash::{rand_core::OsRng, SaltString};
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, Mutex};
-use tokio_tungstenite::accept_async;
-use tokio_tungstenite::tungstenite::Message;
+use uuid::Uuid;
 
 const LEGACY_HISTORY_FILE: &str = "history.jsonl";
-const HISTORY_LIMIT: i64 = 200;
+const PAGE_SIZE: i64 = 30;
 const MAX_TEXT_LEN: usize = 4000;
+const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+// ---------- Сообщения ----------
 
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -29,8 +38,6 @@ struct WireMessage {
     sent_at: String,
 }
 
-// Кадры от клиента. Внутренне тегированный enum: serde читает поле "type",
-// а остальные поля объекта разбирает как содержимое нужного варианта.
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum ClientFrame {
@@ -38,21 +45,33 @@ enum ClientFrame {
         #[serde(rename = "roomId")]
         room_id: String,
     },
+    LoadMore {
+        #[serde(rename = "roomId")]
+        room_id: String,
+        #[serde(rename = "beforeSentAt")]
+        before_sent_at: String,
+    },
     Leave,
     Send(WireMessage),
 }
 
-// Кадры к клиенту, тем же способом, только на сериализацию.
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum ServerFrame {
-    Summary { messages: Vec<WireMessage> },
+    Summary {
+        messages: Vec<WireMessage>,
+    },
     History {
         #[serde(rename = "roomId")]
         room_id: String,
         messages: Vec<WireMessage>,
+        #[serde(rename = "hasMore")]
+        has_more: bool,
+        #[serde(rename = "isInitial")]
+        is_initial: bool,
     },
     Message(WireMessage),
+    Preview(WireMessage),
 }
 
 fn is_valid(m: &WireMessage) -> bool {
@@ -64,19 +83,263 @@ fn is_valid(m: &WireMessage) -> bool {
         && (!m.text.is_empty() || m.attachments.is_some())
 }
 
-// ---------- База данных ----------
+fn now_iso() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
 
-async fn init_db() -> PgPool {
-    let url = std::env::var("DATABASE_URL")
-        .expect("DATABASE_URL is not set (create luma-server/.env)");
+// ---------- Аутентификация ----------
 
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .acquire_timeout(Duration::from_secs(15))
-        .connect(&url)
+#[derive(Serialize, Deserialize)]
+struct Claims {
+    sub: String, // user_id
+    username: String,
+    exp: usize,
+}
+
+fn make_token(secret: &str, user_id: &str, username: &str) -> Result<String, jsonwebtoken::errors::Error> {
+    let exp = (chrono::Utc::now() + chrono::Duration::days(30)).timestamp() as usize;
+    let claims = Claims { sub: user_id.to_string(), username: username.to_string(), exp };
+    jsonwebtoken::encode(
+        &jsonwebtoken::Header::default(),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
+    )
+}
+
+fn decode_token(token: &str, secret: &str) -> Option<Claims> {
+    jsonwebtoken::decode::<Claims>(
+        token,
+        &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+        &jsonwebtoken::Validation::default(),
+    )
+        .ok()
+        .map(|d| d.claims)
+}
+
+// Достаёт токен из заголовка "Authorization: Bearer <token>" — используется
+// эндпоинтом поиска, куда клиент стучится обычным HTTP-запросом.
+fn auth_from_headers(headers: &HeaderMap, secret: &str) -> Option<Claims> {
+    let value = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    let token = value.strip_prefix("Bearer ")?;
+    decode_token(token, secret)
+}
+
+fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
+    let salt = SaltString::generate(&mut OsRng);
+    Ok(Argon2::default().hash_password(password.as_bytes(), &salt)?.to_string())
+}
+
+fn verify_password(password: &str, hash: &str) -> bool {
+    match PasswordHash::new(hash) {
+        Ok(parsed) => Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok(),
+        Err(_) => false,
+    }
+}
+
+fn is_valid_username(u: &str) -> bool {
+    u.len() >= 3
+        && u.len() <= 20
+        && u.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+// ---------- HTTP: регистрация / вход / поиск ----------
+
+#[derive(Deserialize)]
+struct RegisterRequest {
+    email: String,
+    password: String,
+    username: String,
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    email: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthResponse {
+    token: String,
+    user_id: String,
+    username: String,
+}
+
+#[derive(Deserialize)]
+struct SearchParams {
+    q: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UserResult {
+    user_id: String,
+    username: String,
+}
+
+async fn register_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RegisterRequest>,
+) -> Result<Json<AuthResponse>, (StatusCode, String)> {
+    let email = req.email.trim().to_lowercase();
+    let username = req.username.trim().to_lowercase();
+
+    if !email.contains('@') || email.len() > 254 {
+        return Err((StatusCode::BAD_REQUEST, "Некорректный email".into()));
+    }
+    if !is_valid_username(&username) {
+        return Err((StatusCode::BAD_REQUEST, "Юзернейм: 3-20 символов, a-z, 0-9, _".into()));
+    }
+    if req.password.len() < 6 {
+        return Err((StatusCode::BAD_REQUEST, "Пароль минимум 6 символов".into()));
+    }
+
+    let password_hash = hash_password(&req.password)
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка хеширования".into()))?;
+    let user_id = Uuid::new_v4().to_string();
+
+    let result = sqlx::query(
+        "INSERT INTO users (id, email, username, password_hash) VALUES ($1, $2, $3, $4)",
+    )
+        .bind(&user_id)
+        .bind(&email)
+        .bind(&username)
+        .bind(&password_hash)
+        .execute(&state.pool)
+        .await;
+
+    if let Err(e) = result {
+        if let Some(db_err) = e.as_database_error() {
+            if db_err.code().as_deref() == Some("23505") {
+                return Err((StatusCode::CONFLICT, "Такой email или юзернейм уже занят".into()));
+            }
+        }
+        eprintln!("register db error: {e}");
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, "Ошибка базы данных".into()));
+    }
+
+    let token = make_token(&state.jwt_secret, &user_id, &username)
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка токена".into()))?;
+
+    Ok(Json(AuthResponse { token, user_id, username }))
+}
+
+async fn login_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<LoginRequest>,
+) -> Result<Json<AuthResponse>, (StatusCode, String)> {
+    let email = req.email.trim().to_lowercase();
+
+    let row = sqlx::query("SELECT id, username, password_hash FROM users WHERE email = $1")
+        .bind(&email)
+        .fetch_optional(&state.pool)
         .await
-        .expect("cannot connect to database");
+        .map_err(|e| {
+            eprintln!("login db error: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка базы данных".into())
+        })?
+        .ok_or((StatusCode::UNAUTHORIZED, "Неверный email или пароль".into()))?;
 
+    let hash: String = row.get("password_hash");
+    if !verify_password(&req.password, &hash) {
+        return Err((StatusCode::UNAUTHORIZED, "Неверный email или пароль".into()));
+    }
+
+    let user_id: String = row.get("id");
+    let username: String = row.get("username");
+    let token = make_token(&state.jwt_secret, &user_id, &username)
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка токена".into()))?;
+
+    Ok(Json(AuthResponse { token, user_id, username }))
+}
+
+async fn search_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<SearchParams>,
+) -> Result<Json<Vec<UserResult>>, (StatusCode, String)> {
+    let claims = auth_from_headers(&headers, &state.jwt_secret)
+        .ok_or((StatusCode::UNAUTHORIZED, "Требуется вход".into()))?;
+
+    let q = params.q.trim().to_lowercase();
+    if q.len() < 2 {
+        return Ok(Json(vec![]));
+    }
+    let pattern = format!("%{q}%");
+
+    let rows = sqlx::query(
+        "SELECT id, username FROM users WHERE username ILIKE $1 AND id <> $2 ORDER BY username LIMIT 20",
+    )
+        .bind(&pattern)
+        .bind(&claims.sub)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(|e| {
+            eprintln!("search db error: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка базы данных".into())
+        })?;
+
+    let results = rows
+        .iter()
+        .map(|r| UserResult { user_id: r.get("id"), username: r.get("username") })
+        .collect();
+
+    Ok(Json(results))
+}
+#[derive(Deserialize)]
+struct FcmTokenRequest {
+    token: String,
+}
+
+async fn save_fcm_token_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<FcmTokenRequest>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let claims = auth_from_headers(&headers, &state.jwt_secret)
+        .ok_or((StatusCode::UNAUTHORIZED, "Требуется вход".into()))?;
+
+    sqlx::query(
+        "INSERT INTO fcm_tokens (user_id, token, updated_at)
+         VALUES ($1, $2, now())
+         ON CONFLICT (user_id) DO UPDATE SET token = $2, updated_at = now()",
+    )
+        .bind(&claims.sub)
+        .bind(&req.token)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| {
+            eprintln!("save fcm token db error: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка базы данных".into())
+        })?;
+
+    Ok(StatusCode::OK)
+}
+// ---------- База данных: сообщения ----------
+
+async fn init_db(pool: &PgPool) {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS users (
+            id            TEXT PRIMARY KEY,
+            email         TEXT NOT NULL UNIQUE,
+            username      TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+        )",
+    )
+        .execute(pool)
+        .await
+        .expect("cannot create users table");
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS fcm_tokens (
+        user_id    TEXT PRIMARY KEY,
+        token      TEXT NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )",
+    )
+        .execute(pool)
+        .await
+        .expect("cannot create fcm_tokens table");
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS messages (
             id          TEXT PRIMARY KEY,
@@ -90,19 +353,14 @@ async fn init_db() -> PgPool {
             created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
         )",
     )
-        .execute(&pool)
+        .execute(pool)
         .await
-        .expect("cannot create table");
+        .expect("cannot create messages table");
 
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_messages_room_sent
-         ON messages (room_id, sent_at)",
-    )
-        .execute(&pool)
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_room_sent ON messages (room_id, sent_at)")
+        .execute(pool)
         .await
         .expect("cannot create index");
-
-    pool
 }
 
 async fn save_message(pool: &PgPool, m: &WireMessage) -> Result<bool, sqlx::Error> {
@@ -142,44 +400,53 @@ fn row_to_message(r: &PgRow) -> WireMessage {
 const SENT_AT_EXPR: &str =
     "to_char(sent_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS sent_at";
 
-// Последние N сообщений ОДНОЙ комнаты. Берём свежие первыми (удобно для
-// LIMIT), а затем переворачиваем в Rust, чтобы клиенту прийти по
-// возрастанию времени — без вложенных подзапросов ради этого в SQL.
-async fn load_room_history(pool: &PgPool, room_id: &str, limit: i64) -> Vec<WireMessage> {
-    let sql = format!(
-        "SELECT id, room_id, user_id, author_name, avatar_url, text, attachments, {SENT_AT_EXPR}
-         FROM messages
-         WHERE room_id = $1
-         ORDER BY sent_at DESC, created_at DESC
-         LIMIT $2"
-    );
-    let rows = sqlx::query(&sql).bind(room_id).bind(limit).fetch_all(pool).await;
+async fn load_room_page(
+    pool: &PgPool,
+    room_id: &str,
+    before: Option<&str>,
+    limit: i64,
+) -> (Vec<WireMessage>, bool) {
+    let sql = match before {
+        None => format!(
+            "SELECT id, room_id, user_id, author_name, avatar_url, text, attachments, {SENT_AT_EXPR}
+             FROM messages WHERE room_id = $1
+             ORDER BY sent_at DESC, created_at DESC LIMIT $2"
+        ),
+        Some(_) => format!(
+            "SELECT id, room_id, user_id, author_name, avatar_url, text, attachments, {SENT_AT_EXPR}
+             FROM messages WHERE room_id = $1 AND sent_at < $3::timestamptz
+             ORDER BY sent_at DESC, created_at DESC LIMIT $2"
+        ),
+    };
 
-    match rows {
+    let query = sqlx::query(&sql).bind(room_id).bind(limit + 1);
+    let query = match before {
+        Some(ts) => query.bind(ts),
+        None => query,
+    };
+
+    match query.fetch_all(pool).await {
         Ok(rows) => {
-            let mut messages: Vec<WireMessage> = rows.iter().map(row_to_message).collect();
+            let has_more = rows.len() as i64 > limit;
+            let mut messages: Vec<WireMessage> =
+                rows.iter().take(limit as usize).map(row_to_message).collect();
             messages.reverse();
-            messages
+            (messages, has_more)
         }
         Err(e) => {
             eprintln!("db read error (history): {e}");
-            Vec::new()
+            (Vec::new(), false)
         }
     }
 }
 
-// По одному последнему сообщению на каждую комнату — для превью в списке
-// чатов, ещё до того как пользователь куда-то зашёл.
 async fn load_summary(pool: &PgPool) -> Vec<WireMessage> {
     let sql = format!(
         "SELECT DISTINCT ON (room_id)
                 id, room_id, user_id, author_name, avatar_url, text, attachments, {SENT_AT_EXPR}
-         FROM messages
-         ORDER BY room_id, sent_at DESC, created_at DESC"
+         FROM messages ORDER BY room_id, sent_at DESC, created_at DESC"
     );
-    let rows = sqlx::query(&sql).fetch_all(pool).await;
-
-    match rows {
+    match sqlx::query(&sql).fetch_all(pool).await {
         Ok(rows) => rows.iter().map(row_to_message).collect(),
         Err(e) => {
             eprintln!("db read error (summary): {e}");
@@ -206,94 +473,107 @@ async fn import_legacy_history(pool: &PgPool) {
     println!("Imported {imported} messages from {LEGACY_HISTORY_FILE}");
 }
 
-// ---------- Сервер ----------
+// ---------- WebSocket ----------
 
-#[tokio::main]
-async fn main() {
-    dotenvy::dotenv().ok();
-
-    let pool = init_db().await;
-    import_legacy_history(&pool).await;
-    println!("DB ready (Postgres)");
-
-    let listener = TcpListener::bind("127.0.0.1:8080").await.unwrap();
-    println!("Luma WS relay running on ws://127.0.0.1:8080");
-
-    // (sender_id, room_id, JSON-кадр): каждое соединение само решает,
-    // интересна ли ему эта комната, при получении из broadcast.
-    let (tx, _rx) = broadcast::channel::<(usize, String, String)>(200);
-    let next_id = Arc::new(Mutex::new(0usize));
-
-    loop {
-        let (stream, _) = listener.accept().await.unwrap();
-        let tx = tx.clone();
-        let rx = tx.subscribe();
-        let next_id = next_id.clone();
-        let pool = pool.clone();
-
-        tokio::spawn(async move {
-            let mut id_guard = next_id.lock().await;
-            let my_id = *id_guard;
-            *id_guard += 1;
-            drop(id_guard);
-
-            handle_connection(stream, my_id, tx, rx, pool).await;
-        });
-    }
+struct AppState {
+    pool: PgPool,
+    jwt_secret: String,
+    tx: broadcast::Sender<(usize, WireMessage)>,
+    next_id: Mutex<usize>,
 }
 
-async fn handle_connection(
-    stream: TcpStream,
-    my_id: usize,
-    tx: broadcast::Sender<(usize, String, String)>,
-    mut rx: broadcast::Receiver<(usize, String, String)>,
-    pool: PgPool,
-) {
-    let ws_stream = match accept_async(stream).await {
-        Ok(ws) => ws,
-        Err(_) => return,
-    };
-    let (mut write, mut read) = ws_stream.split();
+#[derive(Deserialize)]
+struct WsQuery {
+    token: String,
+}
 
-    // Сводка сразу при подключении, ещё до всякого join.
-    let summary = load_summary(&pool).await;
+async fn ws_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<WsQuery>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let claims = match decode_token(&query.token, &state.jwt_secret) {
+        Some(c) => c,
+        None => return (StatusCode::UNAUTHORIZED, "invalid token").into_response(),
+    };
+    ws.on_upgrade(move |socket| handle_connection(socket, claims.sub, claims.username, state))
+}
+
+async fn handle_connection(socket: WebSocket, user_id: String, username: String, state: Arc<AppState>) {
+    let (mut write, mut read) = socket.split();
+
+    let my_id = {
+        let mut guard = state.next_id.lock().await;
+        let id = *guard;
+        *guard += 1;
+        id
+    };
+    let mut rx = state.tx.subscribe();
+
+    let summary = load_summary(&state.pool).await;
     if !summary.is_empty() {
         let json = serde_json::to_string(&ServerFrame::Summary { messages: summary }).unwrap();
-        if write.send(Message::Text(json)).await.is_err() {
+        if write.send(WsMessage::Text(json)).await.is_err() {
             return;
         }
     }
 
-    // Комната, которую сейчас смотрит этот клиент. None — он в списке
-    // чатов, живые сообщения ему пока не нужны.
     let mut current_room: Option<String> = None;
 
     loop {
         tokio::select! {
             incoming = read.next() => {
                 match incoming {
-                    Some(Ok(Message::Text(text))) => {
+                    Some(Ok(WsMessage::Text(text))) => {
+                        if text.len() > MAX_FRAME_BYTES {
+                            eprintln!("dropped oversized frame: {} bytes", text.len());
+                            continue;
+                        }
+
                         match serde_json::from_str::<ClientFrame>(&text) {
                             Ok(ClientFrame::Join { room_id }) => {
-                                let messages = load_room_history(&pool, &room_id, HISTORY_LIMIT).await;
-                                let frame = ServerFrame::History { room_id: room_id.clone(), messages };
+                                let (messages, has_more) =
+                                    load_room_page(&state.pool, &room_id, None, PAGE_SIZE).await;
+                                let frame = ServerFrame::History {
+                                    room_id: room_id.clone(),
+                                    messages,
+                                    has_more,
+                                    is_initial: true,
+                                };
                                 current_room = Some(room_id);
                                 let json = serde_json::to_string(&frame).unwrap();
-                                if write.send(Message::Text(json)).await.is_err() {
+                                if write.send(WsMessage::Text(json)).await.is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(ClientFrame::LoadMore { room_id, before_sent_at }) => {
+                                let (messages, has_more) =
+                                    load_room_page(&state.pool, &room_id, Some(&before_sent_at), PAGE_SIZE)
+                                        .await;
+                                let frame = ServerFrame::History {
+                                    room_id,
+                                    messages,
+                                    has_more,
+                                    is_initial: false,
+                                };
+                                let json = serde_json::to_string(&frame).unwrap();
+                                if write.send(WsMessage::Text(json)).await.is_err() {
                                     break;
                                 }
                             }
                             Ok(ClientFrame::Leave) => {
                                 current_room = None;
                             }
-                            Ok(ClientFrame::Send(m)) => {
+                            Ok(ClientFrame::Send(mut m)) => {
+                                // Личность и время отправителя ставит сервер, а не клиент.
+                                m.user_id = user_id.clone();
+                                m.author_name = username.clone();
+                                m.sent_at = now_iso();
+
                                 if is_valid(&m) {
-                                    match save_message(&pool, &m).await {
+                                    match save_message(&state.pool, &m).await {
                                         Ok(true) => {
-                                            let room_id = m.room_id.clone();
-                                            let json =
-                                                serde_json::to_string(&ServerFrame::Message(m)).unwrap();
-                                            let _ = tx.send((my_id, room_id, json));
+                                            let _ = state.tx.send((my_id, m));
                                         }
                                         Ok(false) => {}
                                         Err(e) => eprintln!("db write error: {e}"),
@@ -303,24 +583,77 @@ async fn handle_connection(
                             Err(e) => eprintln!("bad client frame: {e}"),
                         }
                     }
-                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                    Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
                     _ => {}
                 }
             }
 
             outgoing = rx.recv() => {
                 match outgoing {
-                    Ok((sender_id, room_id, json)) => {
-                        // Своё эхо не шлём, чужое — только если сейчас в этой же комнате.
-                        if sender_id != my_id && current_room.as_deref() == Some(room_id.as_str()) {
-                            if write.send(Message::Text(json)).await.is_err() {
-                                break;
-                            }
+                    Ok((sender_id, m)) => {
+                        if sender_id == my_id {
+                            continue;
+                        }
+                        let frame = if current_room.as_deref() == Some(m.room_id.as_str()) {
+                            ServerFrame::Message(m)
+                        } else {
+                            ServerFrame::Preview(m)
+                        };
+                        let json = serde_json::to_string(&frame).unwrap();
+                        if write.send(WsMessage::Text(json)).await.is_err() {
+                            break;
                         }
                     }
-                    Err(_) => {} // это соединение отстало от канала — пропускаем, не критично для MVP
+                    Err(_) => {}
                 }
             }
         }
     }
+}
+
+// ---------- main ----------
+
+#[tokio::main]
+async fn main() {
+    dotenvy::dotenv().ok();
+
+    let url = std::env::var("DATABASE_URL").expect("DATABASE_URL is not set (create luma-server/.env)");
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .acquire_timeout(Duration::from_secs(15))
+        .connect(&url)
+        .await
+        .expect("cannot connect to database");
+
+    init_db(&pool).await;
+    import_legacy_history(&pool).await;
+    println!("DB ready (Postgres)");
+
+    let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| {
+        eprintln!("WARNING: JWT_SECRET is not set — using an insecure default. Set it in .env.");
+        "dev-insecure-secret-change-me".to_string()
+    });
+
+    let (tx, _rx) = broadcast::channel::<(usize, WireMessage)>(200);
+
+    let state = Arc::new(AppState {
+        pool,
+        jwt_secret,
+        tx,
+        next_id: Mutex::new(0),
+    });
+
+    let app = Router::new()
+        .route("/api/register", post(register_handler))
+        .route("/api/login", post(login_handler))
+        .route("/api/users/search", get(search_handler))
+        .route("/api/fcm-token", post(save_fcm_token_handler))
+        .route("/ws", get(ws_handler))
+        .with_state(state);
+
+    let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+    let addr = format!("0.0.0.0:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    println!("Luma server running on {addr} (HTTP + WS at /ws)");
+    axum::serve(listener, app).await.unwrap();
 }

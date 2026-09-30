@@ -12,7 +12,7 @@ use tauri_plugin_notification::NotificationExt;
 use tokio::sync::{mpsc, Notify};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-const API_BASE: &str = "http://127.0.0.1:8080";
+const API_BASE: &str = "https://luma-otjt.onrender.com";
 
  struct WsState {
     tx: mpsc::UnboundedSender<String>,
@@ -171,7 +171,7 @@ fn main() {
                         }
                     };
 
-                    let url = format!("ws://127.0.0.1:8080/ws?token={active_token}");
+                    let url = format!("wss://luma-otjt.onrender.com/ws?token={active_token}");
                     let mut reconnect_immediately = false;
 
                     match connect_async(&url).await {

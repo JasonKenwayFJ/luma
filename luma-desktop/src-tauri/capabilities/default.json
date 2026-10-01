@@ -6,6 +6,7 @@
   "permissions": [
     "core:default",
     "opener:default",
+    "notification:default",
     "remote-push:allow-get-token",
     "remote-push:allow-request-permission"
   ]

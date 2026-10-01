@@ -38,7 +38,7 @@ pub struct UserResult {
 async fn save_fcm_token(token: String, auth_token: String) -> Result<(), String> {
     let client = reqwest::Client::new();
     let res = client
-        .post(format!("{API_BASE}/api/fcm-token"))
+        .post(format!("{API_BASE}/api/push-token"))
         .bearer_auth(auth_token)
         .json(&serde_json::json!({ "token": token }))
         .send()

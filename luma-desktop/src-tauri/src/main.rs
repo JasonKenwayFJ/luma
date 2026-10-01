@@ -40,7 +40,7 @@ const API_BASE: &str = "https://luma-otjt.onrender.com";
 async fn save_fcm_token(token: String, auth_token: String) -> Result<(), String> {
     let client = reqwest::Client::new();
     let res = client
-        .post(format!("{API_BASE}/api/fcm-token"))
+        .post(format!("{API_BASE}/api/push-token"))
         .bearer_auth(auth_token)
         .json(&serde_json::json!({ "token": token }))
         .send()
@@ -203,7 +203,7 @@ fn main() {
                                                         *summary.lock().unwrap() = Some(text.clone());
                                                         app_handle.emit("ws-frame", text).ok();
                                                     }
-                                                    Some("message") => {
+                                                    Some("message") | Some("preview") => {
                                                         let is_visible = app_handle
                                                             .get_webview_window("main")
                                                             .map(|w| w.is_visible().unwrap_or(false))

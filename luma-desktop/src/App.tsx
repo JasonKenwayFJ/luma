@@ -1,4 +1,12 @@
 import { useEffect, useState, type ReactNode } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
+import {
+    getToken as getFcmToken,
+    onNotificationReceived,
+    onTokenRefresh,
+    requestPermission as requestPushPermission,
+} from "tauri-plugin-remote-push-api";
 import { useChat } from "./hooks/useChat";
 import { CHATS } from "./chats";
 import { UserProfile } from "./types";
@@ -7,9 +15,7 @@ import { addContact, contactsToChats, dmRoomId, loadContacts, type Contact } fro
 import AuthScreen from "./components/AuthScreen";
 import ChatList from "./components/ChatList";
 import ChatView from "./components/ChatView";
-import { requestPermission, getToken } from "tauri-plugin-remote-push-api";
 import "./App.scss";
-import {invoke} from "@tauri-apps/api/core";
 
 function App() {
     const [profile, setProfile] = useState<UserProfile | null>(loadProfile);
@@ -28,25 +34,58 @@ function App() {
             joinRoom(activeChatId);
         }
     }, [connected, activeChatId, joinRoom]);
+
     useEffect(() => {
         if (!profile) return;
 
+        let cancelled = false;
+        let stopListening: (() => void) | undefined;
+
         (async () => {
             try {
-                await requestPermission();
-                const result = await getToken();
-                // Разные версии плагина возвращают то голую строку, то объект
-                // { token: "..." } — обрабатываем оба варианта, а не гадаем один.
-                const token = typeof result === "string" ? result : (result as { token?: string })?.token;
-                console.log("fcm token:", token);
-                if (token) {
-                    await invoke("save_fcm_token", { token, authToken: profile.token });
+                if (!(await isPermissionGranted())) {
+                    await requestPermission();
                 }
-            } catch (e) {
-                console.log("push setup skipped:", e);
+
+                // The remote-push plugin only provides FCM tokens on Android.
+                if (!/android/i.test(navigator.userAgent)) return;
+
+                const permission = await requestPushPermission();
+                if (!permission.granted) return;
+
+                const registerToken = async (token: string) => {
+                    if (!cancelled && token) {
+                        await invoke("save_fcm_token", { token, authToken: profile.token });
+                    }
+                };
+
+                const token = await getFcmToken();
+                await registerToken(token);
+                const refreshListener = await onTokenRefresh(registerToken);
+                const notificationListener = await onNotificationReceived((notification) => {
+                    if (cancelled || (!notification.title && !notification.body)) return;
+                    sendNotification({
+                        title: notification.title || "Luma",
+                        body: notification.body || "Новое сообщение",
+                    });
+                });
+                const cleanup = () => {
+                    void refreshListener.unregister();
+                    void notificationListener.unregister();
+                };
+                if (cancelled) cleanup();
+                else stopListening = cleanup;
+            } catch (error) {
+                console.warn("Notification permission setup failed:", error);
             }
         })();
+
+        return () => {
+            cancelled = true;
+            stopListening?.();
+        };
     }, [profile]);
+
     const handleAuthenticated = (p: UserProfile) => {
         saveProfile(p);
         setProfile(p);

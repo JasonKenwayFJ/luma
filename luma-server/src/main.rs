@@ -1183,6 +1183,8 @@ async fn main() {
         .route("/api/users/search", get(search_handler))
         .route("/api/push-token", post(save_fcm_token_handler))
         .route("/ws", get(ws_handler))
+        .route("/api/health", get(|| async { "OK" }))
+        .route("/api/ping", get(|| async { "Pong!" }))
         .with_state(state);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());

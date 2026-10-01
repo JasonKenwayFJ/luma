@@ -4,5 +4,5 @@ members = [
     "luma-server"
 ]
 [patch.crates-io]
-tauri-plugin-remote-push = { path = "/vendor/tauri-plugin-remote-push" }
+tauri-plugin-remote-push = { path = "vendor/tauri-plugin-remote-push" }
 resolver = "2"

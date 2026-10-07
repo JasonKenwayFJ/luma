@@ -7,7 +7,7 @@ node_modules/
 dist/
 dist-ssr/
 *.local
-
+vendor/
 # Logs
 *.log
 npm-debug.log*

@@ -30,3 +30,20 @@
   color: $text-dim;
   padding: 6px;
 }
+
+.call-panel {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 72px;
+  padding: 10px;
+  background: $surface;
+  border-bottom: 1px solid $border;
+  button { border: 0; border-radius: 8px; padding: 8px 12px; cursor: pointer; }
+  &__remote { max-height: 240px; max-width: 70%; border-radius: 10px; background: #111; }
+  &__local { position: absolute; right: 12px; top: 12px; width: 100px; border-radius: 8px; background: #111; }
+  &__hangup { background: #c93636; color: white; }
+  &__error { color: #c93636; font-size: 13px; }
+}

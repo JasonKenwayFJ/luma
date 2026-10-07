@@ -36,4 +36,5 @@ export type ServerFrame =
     | { type: "summary"; messages: WireMessage[] }
     | { type: "history"; roomId: string; messages: WireMessage[]; hasMore: boolean; isInitial: boolean }
     | (WireMessage & { type: "message" })
-    | (WireMessage & { type: "preview" });
+    | (WireMessage & { type: "preview" })
+    | { type: "callSignal"; from: string; roomId: string; signal: unknown };

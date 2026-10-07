@@ -1,27 +1,43 @@
 import { ChatSummary } from "./types";
 
-const KEY = "luma:contacts";
+const KEY_PREFIX = "luma:contacts:";
+const LEGACY_KEY = "luma:contacts";
 
 export interface Contact {
     userId: string;
     username: string;
 }
 
-export function loadContacts(): Contact[] {
+export function loadContacts(userId: string): Contact[] {
+    if (!userId) return [];
     try {
-        const raw = localStorage.getItem(KEY);
+        const key = `${KEY_PREFIX}${userId}`;
+        let raw = localStorage.getItem(key);
+        if (!raw) {
+            // Keep contacts saved by older versions and associate them with
+            // the account that is currently signed in.
+            raw = localStorage.getItem(LEGACY_KEY);
+            if (raw) {
+                localStorage.setItem(key, raw);
+                localStorage.removeItem(LEGACY_KEY);
+            }
+        }
         if (!raw) return [];
         const arr = JSON.parse(raw);
-        return Array.isArray(arr) ? arr : [];
+        return Array.isArray(arr)
+            ? arr.filter((item): item is Contact =>
+                item && typeof item.userId === "string" && typeof item.username === "string")
+            : [];
     } catch {
         return [];
     }
 }
 
-export function addContact(contact: Contact) {
-    const existing = loadContacts();
+export function addContact(ownerId: string, contact: Contact) {
+    if (!ownerId || !contact.userId || !contact.username) return;
+    const existing = loadContacts(ownerId);
     if (existing.some((c) => c.userId === contact.userId)) return;
-    localStorage.setItem(KEY, JSON.stringify([...existing, contact]));
+    localStorage.setItem(`${KEY_PREFIX}${ownerId}`, JSON.stringify([...existing, contact]));
 }
 
 // Личный чат не хранится на сервере как отдельная сущность — это просто

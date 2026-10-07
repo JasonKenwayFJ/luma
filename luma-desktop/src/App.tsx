@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { isPermissionGranted, requestPermission, sendNotification } from "@tauri-apps/plugin-notification";
+import { check } from "@tauri-apps/plugin-updater";
 import {
     getToken as getFcmToken,
     onNotificationReceived,
@@ -19,10 +20,11 @@ import "./App.scss";
 
 function App() {
     const [profile, setProfile] = useState<UserProfile | null>(loadProfile);
-    const [contacts, setContacts] = useState<Contact[]>(loadContacts);
+    const [contacts, setContacts] = useState<Contact[]>(() => loadContacts(loadProfile()?.userId ?? ""));
     const [activeChatId, setActiveChatId] = useState<string | null>(null);
+    const [checkingUpdates, setCheckingUpdates] = useState(false);
 
-    const { messages, connected, hasMoreByRoom, loadingMore, send, joinRoom, leaveRoom, loadMore } =
+    const { messages, connected, hasMoreByRoom, loadingMore, send, joinRoom, leaveRoom, loadMore, sendSignal, onSignal } =
         useChat(profile);
 
     const directChats = profile ? contactsToChats(contacts, profile.userId) : [];
@@ -88,13 +90,36 @@ function App() {
 
     const handleAuthenticated = (p: UserProfile) => {
         saveProfile(p);
+        setContacts(loadContacts(p.userId));
         setProfile(p);
     };
 
     const handleLogout = () => {
         clearProfile();
+        setContacts([]);
         setProfile(null);
         setActiveChatId(null);
+    };
+
+    const handleCheckUpdates = async () => {
+        if (checkingUpdates) return;
+        setCheckingUpdates(true);
+        try {
+            const update = await check();
+            if (!update) {
+                window.alert("Установлена последняя версия Luma.");
+                return;
+            }
+            const notes = update.body ? `\n\n${update.body}` : "";
+            if (window.confirm(`Доступна версия ${update.version}.${notes}\n\nУстановить обновление?`)) {
+                await update.downloadAndInstall();
+            }
+        } catch (error) {
+            console.error("Updater check failed:", error);
+            window.alert("Не удалось проверить обновления. Проверьте подключение и попробуйте позже.");
+        } finally {
+            setCheckingUpdates(false);
+        }
     };
 
     const closeChat = () => {
@@ -104,8 +129,8 @@ function App() {
 
     const handleStartDirect = (userId: string, username: string) => {
         if (!profile) return;
-        addContact({ userId, username });
-        setContacts(loadContacts());
+        addContact(profile.userId, { userId, username });
+        setContacts(loadContacts(profile.userId));
         setActiveChatId(dmRoomId(profile.userId, userId));
     };
 
@@ -123,6 +148,9 @@ function App() {
                 onBack={closeChat}
                 onSend={(text, attachments) => send({ roomId: activeChat.id, text, attachments })}
                 onLoadMore={(oldestSentAt) => loadMore(activeChat.id, oldestSentAt)}
+                userId={profile.userId}
+                sendSignal={sendSignal}
+                onSignal={onSignal}
             />
         );
     } else {
@@ -135,6 +163,8 @@ function App() {
                 onOpen={setActiveChatId}
                 onStartDirect={handleStartDirect}
                 onLogout={handleLogout}
+                onCheckUpdates={handleCheckUpdates}
+                checkingUpdates={checkingUpdates}
             />
         );
     }

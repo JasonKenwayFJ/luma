@@ -61,7 +61,10 @@ async fn register(email: String, password: String, username: String) -> Result<A
         .map_err(|e| e.to_string())?;
 
     if !res.status().is_success() {
-        return Err(res.text().await.unwrap_or_else(|_| "Ошибка регистрации".into()));
+        return Err(res
+            .text()
+            .await
+            .unwrap_or_else(|_| "Ошибка регистрации".into()));
     }
     res.json::<AuthResult>().await.map_err(|e| e.to_string())
 }
@@ -96,7 +99,9 @@ async fn search_users(query: String, token: String) -> Result<Vec<UserResult>, S
     if !res.status().is_success() {
         return Err("Ошибка поиска".into());
     }
-    res.json::<Vec<UserResult>>().await.map_err(|e| e.to_string())
+    res.json::<Vec<UserResult>>()
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -129,7 +134,10 @@ fn get_history(state: tauri::State<WsState>) -> Option<String> {
 fn frame_type(raw: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(raw)
         .ok()
-        .and_then(|v| v.get("type").and_then(|t| t.as_str().map(|s| s.to_string())))
+        .and_then(|v| {
+            v.get("type")
+                .and_then(|t| t.as_str().map(|s| s.to_string()))
+        })
 }
 
 fn notification_body(raw: &str) -> String {
@@ -287,4 +295,3 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
-

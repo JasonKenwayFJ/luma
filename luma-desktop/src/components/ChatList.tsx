@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ChatMessage, ChatSummary, UserProfile } from "../types";
 import { avatarColor, formatTime, initials } from "../utils";
@@ -18,6 +18,8 @@ interface Props {
     onOpen: (chatId: string) => void;
     onStartDirect: (userId: string, username: string) => void;
     onLogout: () => void;
+    onCheckUpdates: () => void;
+    checkingUpdates: boolean;
 }
 
 function lastMessageOf(messages: ChatMessage[], roomId: string): ChatMessage | undefined {
@@ -33,36 +35,47 @@ function previewOf(m: ChatMessage): string {
     return `${who}: ${body}`;
 }
 
-function ChatList({ profile, chats, messages, connected, onOpen, onStartDirect, onLogout }: Props) {
+function ChatList({ profile, chats, messages, connected, onOpen, onStartDirect, onLogout, onCheckUpdates, checkingUpdates }: Props) {
     const [searchOpen, setSearchOpen] = useState(false);
     const [query, setQuery] = useState("");
     const [results, setResults] = useState<SearchResult[]>([]);
     const [searching, setSearching] = useState(false);
+    const [searchError, setSearchError] = useState("");
+    const requestId = useRef(0);
+    const normalizedQuery = query.trim().replace(/^@/, "");
 
     // Debounce: таймер сбрасывается на каждое нажатие клавиши, и запрос
     // на сервер уходит только если пользователь замер на 300мс — иначе
     // при быстром наборе слова ушло бы по запросу на каждую букву.
     useEffect(() => {
-        if (!searchOpen || query.trim().length < 2) {
+        const currentRequest = ++requestId.current;
+        if (!searchOpen || normalizedQuery.length < 2) {
             setResults([]);
+            setSearching(false);
+            setSearchError("");
             return;
         }
         const handle = setTimeout(async () => {
             setSearching(true);
+            setSearchError("");
+            setResults([]);
             try {
                 const found = await invoke<SearchResult[]>("search_users", {
-                    query: query.trim(),
+                    query: normalizedQuery,
                     token: profile.token,
                 });
-                setResults(found);
-            } catch {
-                setResults([]);
+                if (requestId.current === currentRequest) setResults(found);
+            } catch (error) {
+                if (requestId.current === currentRequest) {
+                    setResults([]);
+                    setSearchError(error instanceof Error ? error.message : "Не удалось выполнить поиск.");
+                }
             } finally {
-                setSearching(false);
+                if (requestId.current === currentRequest) setSearching(false);
             }
         }, 300);
         return () => clearTimeout(handle);
-    }, [query, searchOpen, profile.token]);
+    }, [normalizedQuery, searchOpen, profile.token]);
 
     const handleStartDirect = (r: SearchResult) => {
         onStartDirect(r.userId, r.username);
@@ -83,6 +96,9 @@ function ChatList({ profile, chats, messages, connected, onOpen, onStartDirect, 
                 <button className="icon-btn" onClick={() => setSearchOpen((v) => !v)} title="Найти человека">
                     🔍
                 </button>
+                <button className="link-btn" onClick={onCheckUpdates} disabled={checkingUpdates}>
+                    {checkingUpdates ? "Проверка…" : "Обновления"}
+                </button>
                 <button className="link-btn" onClick={onLogout}>
                     Выйти
                 </button>
@@ -94,13 +110,15 @@ function ChatList({ profile, chats, messages, connected, onOpen, onStartDirect, 
                         className="search-panel__input"
                         value={query}
                         onChange={(e) => setQuery(e.target.value)}
-                        placeholder="Юзернейм..."
+                        placeholder="Поиск по username, например @anna"
                         autoFocus
                     />
                     {searching && <div className="search-panel__hint">Ищем...</div>}
-                    {!searching && query.trim().length >= 2 && results.length === 0 && (
+                    {searchError && <div className="search-panel__hint search-panel__hint--error">{searchError}</div>}
+                    {!searching && !searchError && normalizedQuery.length >= 2 && results.length === 0 && (
                         <div className="search-panel__hint">Никого не нашли</div>
                     )}
+                    {normalizedQuery.length < 2 && <div className="search-panel__hint">Введите минимум 2 символа username.</div>}
                     {results.map((r) => (
                         <button key={r.userId} className="search-panel__result" onClick={() => handleStartDirect(r)}>
                             <div className="search-panel__avatar" style={{ background: avatarColor(r.userId) }}>
@@ -114,10 +132,13 @@ function ChatList({ profile, chats, messages, connected, onOpen, onStartDirect, 
             )}
 
             <main className="chatlist">
-                {chats.map((chat) => {
+                {chats.map((chat, index) => {
                     const last = lastMessageOf(messages, chat.id);
                     return (
-                        <button key={chat.id} className="chat-row" onClick={() => onOpen(chat.id)}>
+                        <div key={chat.id}>
+                        {index === 0 && <div className="chatlist__section">Чаты</div>}
+                        {chat.id.startsWith("dm:") && !chats[index - 1]?.id.startsWith("dm:") && <div className="chatlist__section">Личные чаты</div>}
+                        <button className="chat-row" onClick={() => onOpen(chat.id)}>
                             <div className="chat-row__avatar" style={{ background: avatarColor(chat.id) }}>
                                 {chat.title[0]}
                             </div>
@@ -129,8 +150,10 @@ function ChatList({ profile, chats, messages, connected, onOpen, onStartDirect, 
                                 <div className="chat-row__preview">{last ? previewOf(last) : "Нет сообщений"}</div>
                             </div>
                         </button>
+                        </div>
                     );
                 })}
+                {chats.length === 0 && <div className="chatlist__empty">Пока нет чатов. Найдите человека по username, чтобы начать переписку.</div>}
             </main>
         </div>
     );

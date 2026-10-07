@@ -1,8 +1,10 @@
-import { useEffect, useRef } from "react";
-import { AttachmentMeta, ChatMessage, ChatSummary } from "../types";
+import {useEffect, useRef} from "react";
+import {AttachmentMeta, ChatMessage, ChatSummary} from "../types";
 import Message from "./Message";
 import Composer from "./Composer";
 import ConnectionStatus from "./ConnectionStatus";
+import { useCall } from "../hooks/useCall";
+import type { RTCSignal } from "../hooks/useChat";
 import "./ChatView.scss";
 
 interface Props {
@@ -14,6 +16,9 @@ interface Props {
     onBack: () => void;
     onSend: (text: string, attachments: AttachmentMeta[]) => Promise<void>;
     onLoadMore: (oldestSentAt: string) => void;
+    userId: string;
+    sendSignal: (to: string, roomId: string, signal: RTCSignal) => void;
+    onSignal: (handler: (frame: { from: string; roomId: string; signal: RTCSignal }) => void) => () => void;
 }
 
 function ChatView({
@@ -25,11 +30,20 @@ function ChatView({
                       onBack,
                       onSend,
                       onLoadMore,
+                      userId,
+                      sendSignal,
+                      onSignal,
                   }: Props) {
     const scrollRef = useRef<HTMLDivElement>(null);
     const bottomRef = useRef<HTMLDivElement>(null);
     const firstScroll = useRef(true);
     const prevScrollHeight = useRef<number | null>(null);
+    const call = useCall(chat.id, userId, onSignal, sendSignal);
+    const localVideo = useRef<HTMLVideoElement>(null);
+    const remoteVideo = useRef<HTMLVideoElement>(null);
+
+    useEffect(() => { if (localVideo.current) localVideo.current.srcObject = call.localStream; }, [call.localStream]);
+    useEffect(() => { if (remoteVideo.current) remoteVideo.current.srcObject = call.remoteStream; }, [call.remoteStream]);
 
     useEffect(() => {
         if (prevScrollHeight.current !== null && scrollRef.current) {
@@ -56,14 +70,33 @@ function ChatView({
     return (
         <div className="screen">
             <header className="topbar">
-                <button className="icon-btn" onClick={onBack} title="К списку чатов">
-                    ←
-                </button>
-                <div>
-                    <div className="topbar__title">{chat.title}</div>
-                    <ConnectionStatus connected={connected} />
+                <div className={"topbar__content"}>
+
+
+                    <button className="icon-btn" onClick={onBack} title="К списку чатов">
+                        ←
+                    </button>
+                    <div>
+                        <div className="topbar__title">{chat.title}</div>
+                        <ConnectionStatus connected={connected}/>
+                    </div>
+                    <div className="toolbar__call">
+                        <button onClick={() => void call.start(false)} title="Аудиозвонок">📞</button>
+                        <button onClick={() => void call.start(true)} title="Видеозвонок">🎥</button>
+                    </div>
                 </div>
             </header>
+
+            {(call.incoming || call.active || call.error) && <section className="call-panel">
+                {call.incoming && <div>{call.incoming} звонит вам <button onClick={() => void call.answer()}>Ответить</button></div>}
+                {call.active && <>
+                    <video ref={remoteVideo} autoPlay playsInline className="call-panel__remote" />
+                    <video ref={localVideo} autoPlay playsInline muted className="call-panel__local" />
+                    <button onClick={() => void call.shareScreen()}>Показать экран</button>
+                    <button className="call-panel__hangup" onClick={call.hangup}>Завершить</button>
+                </>}
+                {call.error && <div className="call-panel__error">{call.error}</div>}
+            </section>}
 
             <main className="chat" ref={scrollRef} onScroll={handleScroll}>
                 {loadingMore && <div className="chat__loading">Загрузка истории...</div>}
@@ -74,12 +107,11 @@ function ChatView({
                     <div className="chat__empty">Сообщений пока нет</div>
                 )}
                 {messages.map((m) => (
-                    <Message key={m.id} message={m} />
+                    <Message key={m.id} message={m}/>
                 ))}
-                <div ref={bottomRef} />
+                <div ref={bottomRef}/>
             </main>
-
-            <Composer connected={connected} onSend={onSend} />
+            <Composer connected={connected} onSend={onSend}/>
         </div>
     );
 }

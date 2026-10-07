@@ -23,6 +23,7 @@ export function useChat(profile: UserProfile | null) {
     const [loadingMore, setLoadingMore] = useState(false);
 
     const profileRef = useRef(profile);
+    const signalHandler = useRef<((frame: { from: string; roomId: string; signal: RTCSignal }) => void) | null>(null);
     profileRef.current = profile;
 
     // Подписки на события живут всё время работы приложения — вне
@@ -50,6 +51,8 @@ export function useChat(profile: UserProfile | null) {
                 setMessages((prev) => mergeMessages(prev, frame.messages.map(toChat)));
                 setHasMoreByRoom((prev) => ({ ...prev, [frame.roomId]: frame.hasMore }));
                 if (!frame.isInitial) setLoadingMore(false);
+            } else if (frame.type === "callSignal") {
+                signalHandler.current?.(frame as { from: string; roomId: string; signal: RTCSignal });
             }
         };
 
@@ -93,6 +96,15 @@ export function useChat(profile: UserProfile | null) {
         });
     }, []);
 
+    const sendSignal = useCallback((to: string, roomId: string, signal: RTCSignal) => {
+        void invoke("send_message", { text: JSON.stringify({ type: "signal", to, roomId, signal }) });
+    }, []);
+
+    const onSignal = useCallback((handler: (frame: { from: string; roomId: string; signal: RTCSignal }) => void) => {
+        signalHandler.current = handler;
+        return () => { signalHandler.current = null; };
+    }, []);
+
     const send = useCallback(async ({ roomId, text, attachments }: SendParams) => {
         const p = profileRef.current;
         if (!p) return;
@@ -113,5 +125,7 @@ export function useChat(profile: UserProfile | null) {
         setMessages((prev) => mergeMessages(prev, [{ ...wire, own: true }]));
     }, []);
 
-    return { messages, connected, hasMoreByRoom, loadingMore, send, joinRoom, leaveRoom, loadMore };
+    return { messages, connected, hasMoreByRoom, loadingMore, send, joinRoom, leaveRoom, loadMore, sendSignal, onSignal };
 }
+
+export type RTCSignal = { kind: "offer" | "answer"; description: RTCSessionDescriptionInit } | { kind: "ice"; candidate: RTCIceCandidateInit } | { kind: "hangup" };

@@ -14,7 +14,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 const API_BASE: &str = "https://luma-otjt.onrender.com";
 
- struct WsState {
+struct WsState {
     tx: mpsc::UnboundedSender<String>,
     connected: Arc<AtomicBool>,
     summary: Arc<Mutex<Option<String>>>,
@@ -24,7 +24,7 @@ const API_BASE: &str = "https://luma-otjt.onrender.com";
 
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
- struct AuthResult {
+struct AuthResult {
     token: String,
     user_id: String,
     username: String,
@@ -32,7 +32,7 @@ const API_BASE: &str = "https://luma-otjt.onrender.com";
 
 #[derive(Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
- struct UserResult {
+struct UserResult {
     user_id: String,
     username: String,
 }
@@ -63,12 +63,16 @@ async fn register(email: String, password: String, username: String) -> Result<A
         .map_err(|e| e.to_string())?;
 
     if !res.status().is_success() {
-        return Err(res.text().await.unwrap_or_else(|_| "Ошибка регистрации".into()));
+        return Err(res
+            .text()
+            .await
+            .unwrap_or_else(|_| "Ошибка регистрации".into()));
     }
     res.json::<AuthResult>().await.map_err(|e| e.to_string())
 }
 
-#[tauri::command] async fn login(email: String, password: String) -> Result<AuthResult, String> {
+#[tauri::command]
+async fn login(email: String, password: String) -> Result<AuthResult, String> {
     let client = reqwest::Client::new();
     let res = client
         .post(format!("{API_BASE}/api/login"))
@@ -83,7 +87,8 @@ async fn register(email: String, password: String, username: String) -> Result<A
     res.json::<AuthResult>().await.map_err(|e| e.to_string())
 }
 
-#[tauri::command]async fn search_users(query: String, token: String) -> Result<Vec<UserResult>, String> {
+#[tauri::command]
+async fn search_users(query: String, token: String) -> Result<Vec<UserResult>, String> {
     let client = reqwest::Client::new();
     let res = client
         .get(format!("{API_BASE}/api/users/search"))
@@ -96,37 +101,47 @@ async fn register(email: String, password: String, username: String) -> Result<A
     if !res.status().is_success() {
         return Err("Ошибка поиска".into());
     }
-    res.json::<Vec<UserResult>>().await.map_err(|e| e.to_string())
+    res.json::<Vec<UserResult>>()
+        .await
+        .map_err(|e| e.to_string())
 }
 
-#[tauri::command]fn connect_ws(token: String, state: tauri::State<WsState>) {
+#[tauri::command]
+fn connect_ws(token: String, state: tauri::State<WsState>) {
     *state.token.lock().unwrap() = Some(token);
     state.notify.notify_one();
 }
 
-#[tauri::command]fn disconnect_ws(state: tauri::State<WsState>) {
+#[tauri::command]
+fn disconnect_ws(state: tauri::State<WsState>) {
     *state.token.lock().unwrap() = None;
     state.notify.notify_one();
 }
 
-#[tauri::command]fn send_message(text: String, state: tauri::State<WsState>) -> Result<(), String> {
+#[tauri::command]
+fn send_message(text: String, state: tauri::State<WsState>) -> Result<(), String> {
     state.tx.send(text).map_err(|e| e.to_string())
 }
 
-#[tauri::command]fn get_connection_status(state: tauri::State<WsState>) -> bool {
+#[tauri::command]
+fn get_connection_status(state: tauri::State<WsState>) -> bool {
     state.connected.load(Ordering::SeqCst)
 }
 
-#[tauri::command]fn get_history(state: tauri::State<WsState>) -> Option<String> {
+#[tauri::command]
+fn get_history(state: tauri::State<WsState>) -> Option<String> {
     state.summary.lock().unwrap().clone()
 }
 
 fn frame_type(raw: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(raw)
         .ok()
-        .and_then(|v| v.get("type").and_then(|t| t.as_str().map(|s| s.to_string())))
+        .and_then(|v| {
+            v.get("type")
+                .and_then(|t| t.as_str().map(|s| s.to_string()))
+        })
 }
- 
+
 fn notification_body(raw: &str) -> String {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
         return raw.to_string();
@@ -142,6 +157,7 @@ fn notification_body(raw: &str) -> String {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let app_handle = app.handle().clone();

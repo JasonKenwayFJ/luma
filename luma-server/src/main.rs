@@ -55,7 +55,12 @@ enum ClientFrame {
     },
     Leave,
     Send(WireMessage),
+    Signal { to: String, room_id: String, signal: serde_json::Value },
 }
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CallSignal { from: String, room_id: String, signal: serde_json::Value }
 
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -306,15 +311,21 @@ async fn search_handler(
         .ok_or((StatusCode::UNAUTHORIZED, "Требуется вход".into()))?;
 
     let q = params.q.trim().to_lowercase();
-    if q.len() < 2 {
+    if q.chars().count() < 2
+        || q.chars().count() > 20
+        || !q.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
         return Ok(Json(vec![]));
     }
     let pattern = format!("%{q}%");
+    let prefix = format!("{q}%");
 
     let rows = sqlx::query(
-        "SELECT id, username FROM users WHERE username ILIKE $1 AND id <> $2 ORDER BY username LIMIT 20",
+        "SELECT id, username FROM users WHERE username LIKE $1 AND id <> $4 ORDER BY CASE WHEN username = $2 THEN 0 WHEN username LIKE $3 THEN 1 ELSE 2 END, username LIMIT 20",
     )
         .bind(&pattern)
+        .bind(&q)
+        .bind(&prefix)
         .bind(&claims.sub)
         .fetch_all(&state.pool)
         .await
@@ -575,6 +586,7 @@ struct AppState {
     pool: PgPool,
     jwt_secret: String,
     tx: broadcast::Sender<(usize, WireMessage)>,
+    call_tx: broadcast::Sender<CallSignal>,
     next_id: Mutex<usize>,
     connected_users: Mutex<HashMap<String, usize>>,
     http: reqwest::Client,
@@ -985,6 +997,7 @@ async fn handle_connection(
         id
     };
     let mut rx = state.tx.subscribe();
+    let mut call_rx = state.call_tx.subscribe();
 
     let summary = load_summary(&state.pool).await;
     if !summary.is_empty() {
@@ -1068,6 +1081,15 @@ async fn handle_connection(
                                     }
                                 }
                             }
+                            Ok(ClientFrame::Signal { to, room_id, signal }) => {
+                                let participants = room_id.strip_prefix("dm:").unwrap_or("");
+                                if participants.split(':').any(|id| id == user_id)
+                                    && participants.split(':').any(|id| id == to)
+                                    && !signal.to_string().is_empty()
+                                {
+                                    let _ = state.call_tx.send(CallSignal { from: user_id.clone(), room_id, signal });
+                                }
+                            }
                             Err(e) => eprintln!("bad client frame: {e}"),
                         }
                     }
@@ -1093,6 +1115,18 @@ async fn handle_connection(
                         }
                     }
                     Err(_) => {}
+                }
+            }
+
+            call = call_rx.recv() => {
+                if let Ok(call) = call {
+                    if call.from != user_id {
+                        let target = call.room_id.strip_prefix("dm:").unwrap_or("");
+                        if target.split(':').any(|id| id == user_id) {
+                            let json = serde_json::json!({"type":"callSignal", "from":call.from, "roomId":call.room_id, "signal":call.signal}).to_string();
+                            if write.send(WsMessage::Text(json)).await.is_err() { break; }
+                        }
+                    }
                 }
             }
         }
@@ -1132,6 +1166,7 @@ async fn main() {
     });
 
     let (tx, _rx) = broadcast::channel::<(usize, WireMessage)>(200);
+    let (call_tx, _call_rx) = broadcast::channel::<CallSignal>(100);
 
     let fcm_credentials =
         std::env::var("FCM_SERVICE_ACCOUNT_JSON").ok().and_then(
@@ -1168,6 +1203,7 @@ async fn main() {
         pool,
         jwt_secret,
         tx,
+        call_tx,
         next_id: Mutex::new(0),
         connected_users: Mutex::new(HashMap::new()),
         http: reqwest::Client::new(),

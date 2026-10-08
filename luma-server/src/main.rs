@@ -1,3 +1,8 @@
+pub mod validator;
+pub mod structs;
+pub mod enums;
+pub mod functions;
+
 use argon2::password_hash::{SaltString, rand_core::OsRng};
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
@@ -16,6 +21,17 @@ use std::time::Duration;
 use tokio::sync::{Mutex, broadcast};
 use tokio::time::Instant;
 use uuid::Uuid;
+use crate::enums::client_frame::ClientFrame;
+use crate::enums::server_frame::ServerFrame;
+use crate::functions::authorization::{auth_from_headers, decode_token, is_valid_username};
+use crate::functions::init_db::init_db;
+use crate::functions::login::login_handler;
+use crate::functions::registration::register_handler;
+use crate::functions::search::search_handler;
+use crate::structs::call_signal::CallSignal;
+use crate::structs::claims::Claims;
+use crate::structs::wire_message::WireMessage;
+use crate::validator::is_valid;
 
 const LEGACY_HISTORY_FILE: &str = "history.jsonl";
 const PAGE_SIZE: i64 = 30;
@@ -24,71 +40,12 @@ const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 // ---------- Сообщения ----------
 
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct WireMessage {
-    id: String,
-    user_id: String,
-    room_id: String,
-    author_name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    avatar_url: Option<String>,
-    #[serde(default)]
-    text: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    attachments: Option<serde_json::Value>,
-    sent_at: String,
-}
 
-#[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
-enum ClientFrame {
-    Join {
-        #[serde(rename = "roomId")]
-        room_id: String,
-    },
-    LoadMore {
-        #[serde(rename = "roomId")]
-        room_id: String,
-        #[serde(rename = "beforeSentAt")]
-        before_sent_at: String,
-    },
-    Leave,
-    Send(WireMessage),
-    Signal { to: String, room_id: String, signal: serde_json::Value },
-}
 
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct CallSignal { from: String, room_id: String, signal: serde_json::Value }
 
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
-enum ServerFrame {
-    Summary {
-        messages: Vec<WireMessage>,
-    },
-    History {
-        #[serde(rename = "roomId")]
-        room_id: String,
-        messages: Vec<WireMessage>,
-        #[serde(rename = "hasMore")]
-        has_more: bool,
-        #[serde(rename = "isInitial")]
-        is_initial: bool,
-    },
-    Message(WireMessage),
-    Preview(WireMessage),
-}
 
-fn is_valid(m: &WireMessage) -> bool {
-    !m.id.is_empty()
-        && !m.user_id.is_empty()
-        && !m.room_id.is_empty()
-        && m.author_name.chars().count() <= 50
-        && m.text.chars().count() <= MAX_TEXT_LEN
-        && (!m.text.is_empty() || m.attachments.is_some())
-}
+
+
 
 fn now_iso() -> String {
     chrono::Utc::now()
@@ -98,252 +55,24 @@ fn now_iso() -> String {
 
 // ---------- Аутентификация ----------
 
-#[derive(Serialize, Deserialize)]
-struct Claims {
-    sub: String, // user_id
-    username: String,
-    exp: usize,
-}
 
-fn make_token(
-    secret: &str,
-    user_id: &str,
-    username: &str,
-) -> Result<String, jsonwebtoken::errors::Error> {
-    let exp = (chrono::Utc::now() + chrono::Duration::days(30)).timestamp() as usize;
-    let claims = Claims {
-        sub: user_id.to_string(),
-        username: username.to_string(),
-        exp,
-    };
-    jsonwebtoken::encode(
-        &jsonwebtoken::Header::default(),
-        &claims,
-        &jsonwebtoken::EncodingKey::from_secret(secret.as_bytes()),
-    )
-}
 
-fn decode_token(token: &str, secret: &str) -> Option<Claims> {
-    jsonwebtoken::decode::<Claims>(
-        token,
-        &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
-        &jsonwebtoken::Validation::default(),
-    )
-    .ok()
-    .map(|d| d.claims)
-}
 
-// Достаёт токен из заголовка "Authorization: Bearer <token>" — используется
-// эндпоинтом поиска, куда клиент стучится обычным HTTP-запросом.
-fn auth_from_headers(headers: &HeaderMap, secret: &str) -> Option<Claims> {
-    let value = headers
-        .get(axum::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?;
-    let token = value.strip_prefix("Bearer ")?;
-    decode_token(token, secret)
-}
-
-fn hash_password(password: &str) -> Result<String, argon2::password_hash::Error> {
-    let salt = SaltString::generate(&mut OsRng);
-    Ok(Argon2::default()
-        .hash_password(password.as_bytes(), &salt)?
-        .to_string())
-}
-
-fn verify_password(password: &str, hash: &str) -> bool {
-    match PasswordHash::new(hash) {
-        Ok(parsed) => Argon2::default()
-            .verify_password(password.as_bytes(), &parsed)
-            .is_ok(),
-        Err(_) => false,
-    }
-}
-
-fn is_valid_username(u: &str) -> bool {
-    u.len() >= 3
-        && u.len() <= 20
-        && u.chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-}
 
 // ---------- HTTP: регистрация / вход / поиск ----------
 
-#[derive(Deserialize)]
-struct RegisterRequest {
-    email: String,
-    password: String,
-    username: String,
-}
 
-#[derive(Deserialize)]
-struct LoginRequest {
-    email: String,
-    password: String,
-}
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AuthResponse {
-    token: String,
-    user_id: String,
-    username: String,
-}
 
-#[derive(Deserialize)]
-struct SearchParams {
-    q: String,
-}
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct UserResult {
-    user_id: String,
-    username: String,
-}
 
-async fn register_handler(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<RegisterRequest>,
-) -> Result<Json<AuthResponse>, (StatusCode, String)> {
-    let email = req.email.trim().to_lowercase();
-    let username = req.username.trim().to_lowercase();
 
-    if !email.contains('@') || email.len() > 254 {
-        return Err((StatusCode::BAD_REQUEST, "Некорректный email".into()));
-    }
-    if !is_valid_username(&username) {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "Юзернейм: 3-20 символов, a-z, 0-9, _".into(),
-        ));
-    }
-    if req.password.len() < 6 {
-        return Err((StatusCode::BAD_REQUEST, "Пароль минимум 6 символов".into()));
-    }
 
-    let password_hash = hash_password(&req.password).map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Ошибка хеширования".into(),
-        )
-    })?;
-    let user_id = Uuid::new_v4().to_string();
 
-    let result = sqlx::query(
-        "INSERT INTO users (id, email, username, password_hash) VALUES ($1, $2, $3, $4)",
-    )
-    .bind(&user_id)
-    .bind(&email)
-    .bind(&username)
-    .bind(&password_hash)
-    .execute(&state.pool)
-    .await;
 
-    if let Err(e) = result {
-        if let Some(db_err) = e.as_database_error() {
-            if db_err.code().as_deref() == Some("23505") {
-                return Err((
-                    StatusCode::CONFLICT,
-                    "Такой email или юзернейм уже занят".into(),
-                ));
-            }
-        }
-        eprintln!("register db error: {e}");
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Ошибка базы данных".into(),
-        ));
-    }
 
-    let token = make_token(&state.jwt_secret, &user_id, &username)
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка токена".into()))?;
 
-    Ok(Json(AuthResponse {
-        token,
-        user_id,
-        username,
-    }))
-}
 
-async fn login_handler(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<LoginRequest>,
-) -> Result<Json<AuthResponse>, (StatusCode, String)> {
-    let email = req.email.trim().to_lowercase();
-
-    let row = sqlx::query("SELECT id, username, password_hash FROM users WHERE email = $1")
-        .bind(&email)
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|e| {
-            eprintln!("login db error: {e}");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Ошибка базы данных".into(),
-            )
-        })?
-        .ok_or((StatusCode::UNAUTHORIZED, "Неверный email или пароль".into()))?;
-
-    let hash: String = row.get("password_hash");
-    if !verify_password(&req.password, &hash) {
-        return Err((StatusCode::UNAUTHORIZED, "Неверный email или пароль".into()));
-    }
-
-    let user_id: String = row.get("id");
-    let username: String = row.get("username");
-    let token = make_token(&state.jwt_secret, &user_id, &username)
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка токена".into()))?;
-
-    Ok(Json(AuthResponse {
-        token,
-        user_id,
-        username,
-    }))
-}
-
-async fn search_handler(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Query(params): Query<SearchParams>,
-) -> Result<Json<Vec<UserResult>>, (StatusCode, String)> {
-    let claims = auth_from_headers(&headers, &state.jwt_secret)
-        .ok_or((StatusCode::UNAUTHORIZED, "Требуется вход".into()))?;
-
-    let q = params.q.trim().to_lowercase();
-    if q.chars().count() < 2
-        || q.chars().count() > 20
-        || !q.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
-    {
-        return Ok(Json(vec![]));
-    }
-    let pattern = format!("%{q}%");
-    let prefix = format!("{q}%");
-
-    let rows = sqlx::query(
-        "SELECT id, username FROM users WHERE username LIKE $1 AND id <> $4 ORDER BY CASE WHEN username = $2 THEN 0 WHEN username LIKE $3 THEN 1 ELSE 2 END, username LIMIT 20",
-    )
-        .bind(&pattern)
-        .bind(&q)
-        .bind(&prefix)
-        .bind(&claims.sub)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(|e| {
-            eprintln!("search db error: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, "Ошибка базы данных".into())
-        })?;
-
-    let results = rows
-        .iter()
-        .map(|r| UserResult {
-            user_id: r.get("id"),
-            username: r.get("username"),
-        })
-        .collect();
-
-    Ok(Json(results))
-}
 #[derive(Deserialize)]
 struct FcmTokenRequest {
     token: String,
@@ -394,74 +123,7 @@ async fn save_fcm_token_handler(
 }
 // ---------- База данных: сообщения ----------
 
-async fn init_db(pool: &PgPool) {
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS users (
-            id            TEXT PRIMARY KEY,
-            email         TEXT NOT NULL UNIQUE,
-            username      TEXT NOT NULL UNIQUE,
-            password_hash TEXT NOT NULL,
-            created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
-        )",
-    )
-    .execute(pool)
-    .await
-    .expect("cannot create users table");
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS fcm_tokens (
-        user_id    TEXT PRIMARY KEY,
-        token      TEXT NOT NULL,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-    )",
-    )
-    .execute(pool)
-    .await
-    .expect("cannot create fcm_tokens table");
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS push_tokens (
-            token      TEXT PRIMARY KEY,
-            user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            platform   TEXT NOT NULL CHECK (platform IN ('android', 'windows')),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        )",
-    )
-    .execute(pool)
-    .await
-    .expect("cannot create push_tokens table");
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_push_tokens_user_platform ON push_tokens (user_id, platform)")
-        .execute(pool)
-        .await
-        .expect("cannot create push token index");
-    sqlx::query(
-        "INSERT INTO push_tokens (user_id, token, platform, updated_at)
-         SELECT user_id, token, 'android', updated_at FROM fcm_tokens WHERE btrim(token) <> ''
-         ON CONFLICT (token) DO UPDATE SET user_id = EXCLUDED.user_id, updated_at = EXCLUDED.updated_at",
-    )
-        .execute(pool)
-        .await
-        .expect("cannot migrate fcm tokens");
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS messages (
-            id          TEXT PRIMARY KEY,
-            room_id     TEXT NOT NULL,
-            user_id     TEXT NOT NULL,
-            author_name TEXT NOT NULL,
-            avatar_url  TEXT,
-            text        TEXT NOT NULL,
-            attachments JSONB,
-            sent_at     TIMESTAMPTZ NOT NULL,
-            created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-        )",
-    )
-    .execute(pool)
-    .await
-    .expect("cannot create messages table");
 
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_messages_room_sent ON messages (room_id, sent_at)")
-        .execute(pool)
-        .await
-        .expect("cannot create index");
-}
 
 async fn save_message(pool: &PgPool, m: &WireMessage) -> Result<bool, sqlx::Error> {
     let result = sqlx::query(

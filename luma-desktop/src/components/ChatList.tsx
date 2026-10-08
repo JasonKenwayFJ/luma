@@ -18,8 +18,7 @@ interface Props {
     onOpen: (chatId: string) => void;
     onStartDirect: (userId: string, username: string) => void;
     onLogout: () => void;
-    onCheckUpdates: () => void;
-    checkingUpdates: boolean;
+    onSettings: () => void;
 }
 
 function lastMessageOf(messages: ChatMessage[], roomId: string): ChatMessage | undefined {
@@ -35,7 +34,7 @@ function previewOf(m: ChatMessage): string {
     return `${who}: ${body}`;
 }
 
-function ChatList({ profile, chats, messages, connected, onOpen, onStartDirect, onLogout, onCheckUpdates, checkingUpdates }: Props) {
+function ChatList({ profile, chats, messages, connected, onOpen, onStartDirect, onLogout, onSettings }: Props) {
     const [searchOpen, setSearchOpen] = useState(false);
     const [query, setQuery] = useState("");
     const [results, setResults] = useState<SearchResult[]>([]);
@@ -96,8 +95,8 @@ function ChatList({ profile, chats, messages, connected, onOpen, onStartDirect, 
                 <button className="icon-btn" onClick={() => setSearchOpen((v) => !v)} title="Найти человека">
                     🔍
                 </button>
-                <button className="link-btn" onClick={onCheckUpdates} disabled={checkingUpdates}>
-                    {checkingUpdates ? "Проверка…" : "Обновления"}
+                <button className="icon-btn" onClick={onSettings} title="Настройки" aria-label="Настройки">
+                    ⚙
                 </button>
                 <button className="link-btn" onClick={onLogout}>
                     Выйти

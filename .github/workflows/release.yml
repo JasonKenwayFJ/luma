@@ -1,4 +1,4 @@
-name: Release desktop app
+name: Release Luma
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  desktop:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,8 +36,68 @@ jobs:
           tauriScript: npm run tauri
           tagName: ${{ github.ref_name }}
           releaseName: Luma ${{ github.ref_name }}
-          releaseBody: Signed Windows installers and updater metadata.
+          releaseBody: Signed desktop installers and Android release APK.
           releaseDraft: true
           prerelease: false
           uploadUpdaterJson: true
           updaterJsonPreferNsis: true
+
+  android:
+    runs-on: ubuntu-24.04
+    needs: desktop
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: luma-desktop/package-lock.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-37" "build-tools;37.0.0" "ndk;27.2.12479018"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Install frontend dependencies
+        working-directory: luma-desktop
+        run: npm ci
+
+      - name: Initialize Android project
+        working-directory: luma-desktop
+        run: npm run tauri android init
+
+      - name: Build signed Android APK
+        working-directory: luma-desktop
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: npm run tauri android build -- --apk
+
+      - name: Publish Android APK and update manifest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          version="${TAG#v}"
+          apk="luma-desktop/src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk"
+          test -f "$apk"
+          cp "$apk" "Luma-${version}-android.apk"
+          cat > android-latest.json <<EOF
+          {
+            "version": "${version}",
+            "apkUrl": "https://github.com/${REPOSITORY}/releases/download/${TAG}/Luma-${version}-android.apk"
+          }
+          EOF
+          gh release upload "$TAG" "Luma-${version}-android.apk" android-latest.json --clobber

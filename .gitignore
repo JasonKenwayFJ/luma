@@ -32,3 +32,4 @@ history.jsonl*
 
 # Tauri: сгенерированные мобильные проекты
 /luma-desktop/src-tauri/gen/
+/luma-desktop/src-tauri/signing/

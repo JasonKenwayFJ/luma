@@ -16,13 +16,17 @@ import { addContact, contactsToChats, dmRoomId, loadContacts, type Contact } fro
 import AuthScreen from "./components/AuthScreen";
 import ChatList from "./components/ChatList";
 import ChatView from "./components/ChatView";
+import SettingsView from "./components/SettingsView";
 import "./App.scss";
 
 function App() {
     const [profile, setProfile] = useState<UserProfile | null>(loadProfile);
     const [contacts, setContacts] = useState<Contact[]>(() => loadContacts(loadProfile()?.userId ?? ""));
     const [activeChatId, setActiveChatId] = useState<string | null>(null);
+    const [settingsOpen, setSettingsOpen] = useState(false);
     const [checkingUpdates, setCheckingUpdates] = useState(false);
+    const [updateMessage, setUpdateMessage] = useState("");
+    const [updateError, setUpdateError] = useState(false);
 
     const { messages, connected, hasMoreByRoom, loadingMore, send, joinRoom, leaveRoom, loadMore, sendSignal, onSignal } =
         useChat(profile);
@@ -104,19 +108,26 @@ function App() {
     const handleCheckUpdates = async () => {
         if (checkingUpdates) return;
         setCheckingUpdates(true);
+        setUpdateError(false);
+        setUpdateMessage("Проверяем наличие обновлений…");
         try {
             const update = await check();
             if (!update) {
-                window.alert("Установлена последняя версия Luma.");
+                setUpdateMessage("Установлена последняя версия Luma.");
                 return;
             }
             const notes = update.body ? `\n\n${update.body}` : "";
             if (window.confirm(`Доступна версия ${update.version}.${notes}\n\nУстановить обновление?`)) {
+                setUpdateMessage(`Загружаем версию ${update.version}…`);
                 await update.downloadAndInstall();
+                setUpdateMessage("Обновление установлено. Перезапустите приложение, чтобы использовать новую версию.");
+            } else {
+                setUpdateMessage(`Доступна версия ${update.version}.`);
             }
         } catch (error) {
             console.error("Updater check failed:", error);
-            window.alert("Не удалось проверить обновления. Проверьте подключение и попробуйте позже.");
+            setUpdateError(true);
+            setUpdateMessage(error instanceof Error ? error.message : String(error));
         } finally {
             setCheckingUpdates(false);
         }
@@ -137,6 +148,17 @@ function App() {
     let screen: ReactNode;
     if (!profile) {
         screen = <AuthScreen onAuthenticated={handleAuthenticated} />;
+    } else if (settingsOpen) {
+        screen = (
+            <SettingsView
+                username={profile.username}
+                checkingUpdates={checkingUpdates}
+                updateMessage={updateMessage}
+                updateError={updateError}
+                onBack={() => setSettingsOpen(false)}
+                onCheckUpdates={handleCheckUpdates}
+            />
+        );
     } else if (activeChat) {
         screen = (
             <ChatView
@@ -163,8 +185,7 @@ function App() {
                 onOpen={setActiveChatId}
                 onStartDirect={handleStartDirect}
                 onLogout={handleLogout}
-                onCheckUpdates={handleCheckUpdates}
-                checkingUpdates={checkingUpdates}
+                onSettings={() => setSettingsOpen(true)}
             />
         );
     }

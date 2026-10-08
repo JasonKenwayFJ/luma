@@ -53,6 +53,7 @@ export function useCall(roomId: string, userId: string, onSignal: (handler: (fra
         if (!otherId || !roomId.startsWith("dm:")) return setError("Звонки доступны в личных чатах.");
         try {
             setError("");
+            pendingIce.current = [];
             local.current = await navigator.mediaDevices.getUserMedia({ audio: true, video });
             setLocalStream(local.current);
             const connection = createPeer(otherId);
@@ -72,13 +73,15 @@ export function useCall(roomId: string, userId: string, onSignal: (handler: (fra
         if (signal.kind === "offer") {
             setIncoming(from);
             peer.current?.close();
+            peer.current = null;
+            pendingIce.current = [];
             // Keep the offer until the user accepts the call.
             pendingOffer.current = signal.description;
         } else if (signal.kind === "answer" && peer.current) {
             await peer.current.setRemoteDescription(signal.description);
             await Promise.all(pendingIce.current.splice(0).map((candidate) => peer.current!.addIceCandidate(candidate).catch(() => undefined)));
-        } else if (signal.kind === "ice" && peer.current) {
-            if (peer.current.remoteDescription) await peer.current.addIceCandidate(signal.candidate).catch(() => undefined);
+        } else if (signal.kind === "ice") {
+            if (peer.current?.remoteDescription) await peer.current.addIceCandidate(signal.candidate).catch(() => undefined);
             else pendingIce.current.push(signal.candidate);
         }
     }), [close, onSignal, roomId]);
